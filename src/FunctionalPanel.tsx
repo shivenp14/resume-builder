@@ -1,0 +1,12 @@
+import {useEffect,useState} from 'react';
+import {api,ApiApplication,ApiItem} from './api';
+/** Backend-backed controls can be embedded in any page; deliberately compact for MVP. */
+export function FunctionalPanel(){
+ const [items,setItems]=useState<ApiItem[]>([]),[apps,setApps]=useState<ApiApplication[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [title,setTitle]=useState(''),[company,setCompany]=useState(''),[position,setPosition]=useState(''),[description,setDescription]=useState('');
+ const refresh=()=>Promise.all([api<ApiItem[]>('/content-items'),api<ApiApplication[]>('/applications')]).then(([i,a])=>{setItems(i);setApps(a)}).catch(()=>setError('Backend unavailable. Start FastAPI and refresh.'));
+ useEffect(()=>{refresh()},[]);
+ async function addItem(){if(!title)return;setBusy(true);try{await api('/content-items',{method:'POST',body:JSON.stringify({type:'experience',title})});setTitle('');await refresh()}catch(e){setError(String(e))}finally{setBusy(false)}}
+ async function addApp(){if(!company||!position||!description)return;setBusy(true);try{const base=await api<any[]>('/base-resumes');if(!base[0])throw Error('Create a base resume first');const a=await api<ApiApplication>('/applications',{method:'POST',body:JSON.stringify({company,position,job_description:description,base_resume_id:base[0].id})});await api(`/applications/${a.id}/analyze`,{method:'POST'});setCompany('');setPosition('');setDescription('');await refresh()}catch(e){setError(String(e))}finally{setBusy(false)}}
+ return <div className="functional"><div className="functional-head"><b>Connected workspace</b><span>{items.length} source items · {apps.length} applications</span></div>{error&&<small className="error">{error}</small>}<div className="functional-forms"><div><label>Add source item</label><input value={title} onChange={e=>setTitle(e.target.value)} placeholder="e.g. Research assistant"/><button className="newbtn" disabled={busy} onClick={addItem}>Save item</button></div><div><label>Create + analyze application</label><div className="inline"><input value={company} onChange={e=>setCompany(e.target.value)} placeholder="Company"/><input value={position} onChange={e=>setPosition(e.target.value)} placeholder="Role"/></div><textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Paste job description"/><button className="newbtn" disabled={busy} onClick={addApp}>Create and analyze</button></div></div></div>
+}

@@ -1,0 +1,36 @@
+# Dependencies and build output
+node_modules/
+dist/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.tsbuildinfo
+
+# Local data, generated artifacts, and scratch work
+data/*.db
+generated/
+output/
+tmp/
+checkpoints/
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.pdf
+*.tex
+!backend/app/services/templates/*.tex
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS/editor files
+.DS_Store
+.vscode/*
+!.vscode/settings.json

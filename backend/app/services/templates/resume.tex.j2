@@ -1,0 +1,23 @@
+\documentclass[letterpaper,11pt]{article}
+\usepackage[empty]{fullpage}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage[T1]{fontenc}
+\pagestyle{empty}\setlength{\parindent}{0pt}
+\newcommand{\resumeItem}[1]{\item\small{ {{ '#1' }} }}
+\begin{document}
+\begin{center}
+{\Large\textbf{ {{ resume.contact.name|latex }} }}\\
+{{ resume.contact.location|default('')|latex }} $|$ {{ resume.contact.email|default('')|latex }} $|$ {{ resume.contact.phone|default('')|latex }}
+\end{center}
+{% for section in resume.sections|default([]) %}
+\section*{ {{ section.title|latex }} }
+{% for entry in section.entries|default([]) %}
+\textbf{ {{ entry.title|latex }} } \hfill {{ entry.dates|default('')|latex }}\\
+\textit{ {{ entry.organization|default('')|latex }} }{% if entry.location|default('', true) %} \hfill {{ entry.location|default('')|latex }}{% endif %}
+\begin{itemize}[leftmargin=*]
+{% for bullet in entry.bullets|default([]) %}\resumeItem{ {{ bullet.text|latex }} }
+{% endfor %}\end{itemize}
+{% endfor %}
+{% endfor %}
+\end{document}
