@@ -1,12 +1,9 @@
-# Dependencies and build output
-node_modules/
-dist/
+# Python dependencies and test output
 backend/.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
-*.tsbuildinfo
 
 # Local data, generated artifacts, and scratch work
 data/*.db
