@@ -4,6 +4,19 @@ Local-first resume intelligence and tailoring backend. It stores verified
 resume content, base resumes, applications, analyses, proposals, and immutable
 revision snapshots in SQLite.
 
+## Codex provider
+
+AI analysis and proposal generation use the locally authenticated Codex CLI;
+the application does not require or store an OpenAI API key. The configured
+defaults are model `gpt-5.6-luna`, low reasoning, and the normal/default
+service tier. Sign in to Codex on the machine running the API before invoking
+the optimization endpoints. Provider calls are read-only, scoped to the
+selected application, and persisted as auditable optimization runs; failures
+return `503` without creating partial analysis or proposal records.
+
+The provider can be replaced with an injected fake in tests, so the test suite
+does not make network calls or depend on a Codex session.
+
 Frontend development is intentionally deferred. The current project scope is
 the backend data model, API contracts, validation, matching, revision history,
 and rendering every resume through the canonical baseline LaTeX template to

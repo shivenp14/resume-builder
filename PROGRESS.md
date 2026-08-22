@@ -1,6 +1,6 @@
 # Backend Progress
 
-Updated: August 20, 2026
+Updated: August 22, 2026
 
 ## Done
 
@@ -10,10 +10,11 @@ Updated: August 20, 2026
 - [x] Skills
 - [x] Base resumes and selected entries
 - [x] Applications and job descriptions
-- [x] Deterministic job analysis
+- [x] Codex-backed job analysis with local CLI authentication (GPT-5.6 Luna, low reasoning, default service tier)
 - [x] Resume-to-job comparison
 - [x] Missing-information confirmations
 - [x] Optimization proposal storage and decisions
+- [x] Offline provider-injection tests for model configuration, failures, audit runs, and proposal validation
 - [x] Locked-bullet and source-ownership validation
 - [x] Basic unsupported-number validation
 - [x] Immutable revision snapshots
@@ -23,7 +24,7 @@ Updated: August 20, 2026
 - [x] Generated artifact storage and static routes
 - [x] Checkpoint resume and application importer
 - [x] OpenAPI documentation at `/docs`
-- [x] Backend test suite: 7/7 passing
+- [x] Backend test suite: 14/14 passing
 
 ## Remaining
 
@@ -39,10 +40,10 @@ Updated: August 20, 2026
 - [ ] Add structured job requirements and evidence links
 - [ ] Improve matching classifications and scoring
 - [ ] Turn confirmed missing information into verified source records
-- [ ] Add an `LLMProvider` interface
-- [ ] Add versioned AI prompts and structured output schemas
-- [ ] Generate evidence-grounded optimization proposals
-- [ ] Store optimization runs and per-change decisions
+- [x] Add an `LLMProvider` interface
+- [x] Add versioned AI prompts and structured output schemas
+- [x] Generate evidence-grounded optimization proposals
+- [x] Store optimization runs and per-change decisions
 - [ ] Add revision comparison
 - [ ] Finalize baseline-template layout constraints and rendering parity
 - [ ] Improve LaTeX failure diagnostics

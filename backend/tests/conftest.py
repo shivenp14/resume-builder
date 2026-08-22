@@ -36,6 +36,14 @@ def isolated_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "GENERATED", test_generated)
     monkeypatch.setattr(main, "engine", test_engine)
     monkeypatch.setattr(main, "SessionLocal", test_session_local)
+    class DeterministicTestProvider:
+        def analyze(self, job_description):
+            return main.analyze_text(job_description)
+
+        def generate_proposal(self, context):
+            return {"schema_version":"1.0","selected_entries":[],"bullet_changes":[],"warnings":[],"rationale":""}
+
+    monkeypatch.setattr(main, "_provider", lambda: DeterministicTestProvider())
     generated_mount = next(route for route in main.app.routes if route.path == "/generated")
     monkeypatch.setattr(generated_mount.app, "directory", test_generated)
     try:

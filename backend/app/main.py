@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json, re
 from pathlib import Path
 from typing import Any
+import uuid
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -14,6 +15,9 @@ from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKe
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from .services.renderer import ResumeRenderer
 from .services.validation import ValidationError, validate_resume_snapshot, validate_proposal
+from .services.codex_provider import CodexProvider, CodexProviderError, MODEL, REASONING
+from .services.llm_prompts import PROMPT_VERSION
+from .services.llm_schemas import SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
@@ -54,6 +58,9 @@ class Revision(Base):
 class MissingConfirmation(Base):
     __tablename__="missing_confirmations"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirement: Mapped[str]=mapped_column(Text); status: Mapped[str]=mapped_column(String(20),default="unresolved"); context: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+class OptimizationRun(Base):
+    __tablename__="optimization_runs"
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); operation: Mapped[str]=mapped_column(String(40)); status: Mapped[str]=mapped_column(String(20),default="running"); model: Mapped[str]=mapped_column(String(100),default="gpt-5.6-luna"); reasoning_effort: Mapped[str]=mapped_column(String(20),default="low"); prompt_version: Mapped[str]=mapped_column(String(40),default="v1"); schema_version: Mapped[str]=mapped_column(String(40),default="v1"); idempotency_key: Mapped[str|None]=mapped_column(String(200)); input_payload: Mapped[dict]=mapped_column(JSON,default=dict); output_payload: Mapped[dict|None]=mapped_column(JSON); error: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
 Base.metadata.create_all(engine)
 def db():
     s=SessionLocal()
@@ -70,6 +77,7 @@ class AppIn(BaseModel): company:str; position:str; job_description:str; base_res
 class ProposalIn(BaseModel): payload:dict
 class RevisionIn(BaseModel): resume_json:dict; latex_path:str|None=None; pdf_path:str|None=None; page_count:int|None=None; status:str="draft"
 class ConfirmationIn(BaseModel): status:str; context:dict={}
+class OptimizationRequest(BaseModel): idempotency_key:str|None=None
 
 app=FastAPI(title="Resume Builder API",version="0.1.0")
 GENERATED = ROOT / "generated"
@@ -176,15 +184,88 @@ def analyze_text(text:str):
     sentences=[x.strip() for x in re.split(r"[.!?\n]+",text) if x.strip()]
     keywords=technologies+sorted(set(re.findall(r"\b[a-zA-Z]{5,}\b",lower)))[:20]
     return {"requirements":sentences[:12],"keywords":keywords,"technologies":technologies,"responsibilities":sentences[:8],"preferred_qualifications":[]}
+def _provider():
+    return CodexProvider()
+
+def _provider_call(provider, operation, payload):
+    names = ("analyze",) if operation == "analysis" else ("generate_proposal", "generate_proposals")
+    for name in names:
+        fn=getattr(provider,name,None)
+        if fn: return fn(payload)
+    raise CodexProviderError("Codex provider does not implement the requested operation")
+
+def _run_error(exc):
+    if isinstance(exc, CodexProviderError): return str(exc)[:2000]
+    return "Unexpected Codex provider failure"
+
 @app.post("/applications/{id}/analyze")
-def analyze(id:int,s:Session=Depends(db)):
+def analyze(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
-    o=JobAnalysis(application_id=id,**analyze_text(a.job_description)); s.add(o); s.commit(); s.refresh(o); return o
+    key=request.idempotency_key if request else None
+    if key:
+        prior=s.query(OptimizationRun).filter_by(application_id=id,operation="analysis",idempotency_key=key).first()
+        if prior and prior.status=="succeeded": return prior.output_payload
+    run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,input_payload={"job_description":a.job_description},model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+    try:
+        result=_provider_call(_provider(),"analysis",a.job_description)
+        if hasattr(result,"model_dump"): result=result.model_dump()
+        if not isinstance(result,dict): raise ValueError("Codex returned invalid analysis")
+        fields={k:list(result.get(k,[])) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")}
+        o=JobAnalysis(application_id=id,**fields); s.add(o); s.flush()
+        run.status="succeeded"; run.output_payload={"id":o.id,**fields}; run.completed_at=now(); s.commit(); s.refresh(o); return o
+    except Exception as exc:
+        run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); s.commit(); raise HTTPException(503,"Codex provider unavailable: "+run.error)
 @app.get("/applications/{id}/analysis")
 def get_analysis(id:int,s:Session=Depends(db)):
     o=s.query(JobAnalysis).filter_by(application_id=id).order_by(JobAnalysis.created_at.desc()).first()
     if not o: raise HTTPException(404,"analysis not found")
+    return o
+@app.post("/applications/{id}/proposals/generate")
+def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)):
+    a=s.get(Application,id)
+    if not a: raise HTTPException(404,"application not found")
+    analysis=s.query(JobAnalysis).filter_by(application_id=id).order_by(JobAnalysis.created_at.desc()).first()
+    if not analysis: raise HTTPException(404,"analyze application first")
+    key=request.idempotency_key if request else None
+    if key:
+        prior=s.query(OptimizationRun).filter_by(application_id=id,operation="proposal",idempotency_key=key).first()
+        if prior and prior.status=="succeeded": return prior.output_payload
+    payload={"analysis":{k:getattr(analysis,k) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")},"snapshot":build_snapshot(a,s),"confirmations":[{"requirement":x.requirement,"status":x.status,"context":x.context} for x in s.query(MissingConfirmation).filter_by(application_id=id)]}
+    all_items=s.query(ContentItem).filter_by(is_archived=False).all()
+    all_bullets=s.query(Bullet).filter(Bullet.content_item_id.in_([item.id for item in all_items])).all() if all_items else []
+    verified={"content_items":[{"id":item.id,"type":item.type,"title":item.title,"organization":item.organization,"summary":item.summary,"tags":item.tags} for item in all_items],
+              "bullets":[{"id":bullet.id,"content_item_id":bullet.content_item_id,"text":bullet.text,"tags":bullet.tags,"supporting_facts":bullet.supporting_facts,"is_locked":bullet.is_locked,"is_preferred":bullet.is_preferred} for bullet in all_bullets]}
+    payload={**payload,"base_snapshot":payload.pop("snapshot"),"verified_library":verified}
+    grounding={**verified,"entries":[]}
+    run=OptimizationRun(application_id=id,operation="proposal",idempotency_key=key,input_payload=payload,model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+    try:
+        out=_provider_call(_provider(),"proposal",payload)
+        if hasattr(out,"model_dump"): out=out.model_dump()
+        if not isinstance(out,dict): raise ValueError("Codex returned invalid proposal")
+        validate_proposal(out, grounding)
+        owned={item.id:{bullet.id for bullet in item.bullets} for item in all_items}
+        for entry in out.get("selected_entries",[]):
+            item_id=entry.get("content_item_id")
+            if item_id not in owned: raise ValidationError("proposal selects unknown content item")
+            if any(bid not in owned[item_id] for bid in entry.get("bullet_ids",[])): raise ValidationError("selected bullet does not belong to content item")
+        # Reuse the existing proposal validation gates before persistence.
+        p=Proposal(application_id=id,payload=out); s.add(p); s.flush()
+        run.status="succeeded"; run.output_payload={"id":p.id,**out}; run.completed_at=now(); s.commit(); s.refresh(p); return p
+    except ValidationError as exc:
+        run.status="failed"; run.error=str(exc)[:2000]; run.completed_at=now(); s.commit(); raise HTTPException(422,str(exc))
+    except Exception as exc:
+        run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); s.commit(); raise HTTPException(503,"Codex provider unavailable: "+run.error)
+
+@app.get("/applications/{id}/optimization-runs")
+def optimization_runs(id:int,s:Session=Depends(db)):
+    if not s.get(Application,id): raise HTTPException(404,"application not found")
+    return s.query(OptimizationRun).filter_by(application_id=id).order_by(OptimizationRun.created_at.desc()).all()
+
+@app.get("/optimization-runs/{id}")
+def optimization_run(id:int,s:Session=Depends(db)):
+    o=s.get(OptimizationRun,id)
+    if not o: raise HTTPException(404,"optimization run not found")
     return o
 def _comparison(a:Application,s:Session):
     analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
