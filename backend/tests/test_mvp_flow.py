@@ -59,7 +59,7 @@ def test_full_tailoring_flow_and_revision_artifacts():
     # Comparison and missing-information resolution are application-scoped.
     comparison = client.get(f"/applications/{application['id']}/comparison")
     assert comparison.status_code == 200
-    assert "docker" in [x.lower() for x in comparison.json()["unsupported"]]
+    assert "docker" in [x["requirement"].lower() for x in comparison.json()["unsupported"]]
     confirmations = client.post(f"/applications/{application['id']}/missing-confirmations")
     assert confirmations.status_code == 200
     confirmation = next(x for x in confirmations.json() if x["requirement"].lower() == "docker")
@@ -139,3 +139,37 @@ def test_revision_is_immutable_after_source_edit():
     assert changed.status_code == 200
     revisions = client.get(f"/applications/{application['id']}/revisions").json()
     assert revisions[0]["resume_json"] == first["resume_json"]
+
+
+def test_project_skills_render_beside_project_title():
+    item = client.post(
+        "/content-items",
+        json={
+            "type": "project",
+            "title": "Agora",
+            "summary": "Electron, React, TypeScript, Playwright, Tesseract.js",
+            "start_date": "Apr. 2026",
+            "end_date": "Present",
+        },
+    ).json()
+    resume = client.post("/base-resumes", json={"name": "Primary"}).json()
+    client.post(
+        f"/base-resumes/{resume['id']}/entries",
+        json={"content_item_id": item["id"], "entry_order": 1},
+    )
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example",
+            "position": "Engineer",
+            "job_description": "Build software",
+            "base_resume_id": resume["id"],
+        },
+    ).json()
+
+    snapshot = client.get(f"/applications/{application['id']}/snapshot").json()
+    assert snapshot["sections"][0]["entries"][0]["skills"] == item["summary"]
+    rendered = client.post("/render", json={"snapshot": snapshot})
+    assert rendered.status_code == 200
+    assert "Agora" in rendered.json()["latex"]
+    assert "Electron, React, TypeScript, Playwright, Tesseract.js" in rendered.json()["latex"]

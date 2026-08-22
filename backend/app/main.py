@@ -8,9 +8,7 @@ import json, re
 from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
@@ -74,17 +72,10 @@ class RevisionIn(BaseModel): resume_json:dict; latex_path:str|None=None; pdf_pat
 class ConfirmationIn(BaseModel): status:str; context:dict={}
 
 app=FastAPI(title="Resume Builder API",version="0.1.0")
-# The Vite client uses /api while the standalone backend is also convenient at /.
-class ApiPrefixMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.scope.get("path", "").startswith("/api/"):
-            request.scope["path"] = request.scope["path"][4:]
-        return await call_next(request)
-app.add_middleware(ApiPrefixMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
 GENERATED = ROOT / "generated"
 GENERATED.mkdir(exist_ok=True)
 app.mount("/generated", StaticFiles(directory=GENERATED), name="generated")
+app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="checkpoints")
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.post("/content-items")
@@ -137,7 +128,9 @@ def skills(s:Session=Depends(db)): return s.query(Skill).all()
 def add_resume(x:ResumeIn,s:Session=Depends(db)):
     o=BaseResume(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/base-resumes")
-def resumes(s:Session=Depends(db)): return s.query(BaseResume).all()
+def resumes(s:Session=Depends(db)):
+    records=s.query(BaseResume).all()
+    return sorted(records,key=lambda record:(not bool((record.layout_settings or {}).get("primary")),record.id))
 @app.get("/base-resumes/{id}")
 def resume(id:int,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
@@ -286,7 +279,14 @@ def build_snapshot(a:Application,s:Session):
     bullets={b.id:b for b in s.query(Bullet).filter(Bullet.content_item_id.in_(list(items))).all()} if items else {}
     sections={}
     for e in entries:
-        item=items[e.content_item_id]; title=item.type.title(); sections.setdefault(title,[]).append({'title':item.title,'organization':item.organization or '','location':item.location or '','dates':' — '.join(x for x in (item.start_date,item.end_date) if x),'bullets':[{'id':bid,'text':bullets[bid].text} for bid in e.selected_bullet_ids if bid in bullets]})
+        item=items[e.content_item_id]; title=item.type.title()
+        sections.setdefault(title,[]).append({'title':item.title,'organization':item.organization or '',
+            'location':item.location or '',
+            'dates':' — '.join(x for x in (item.start_date,item.end_date) if x),
+            # Project technology strings are stored in the content item's
+            # summary and are rendered beside the project title.
+            'skills':item.summary or '' if item.type == 'project' else '',
+            'bullets':[{'id':bid,'text':bullets[bid].text} for bid in e.selected_bullet_ids if bid in bullets]})
     return {'contact':{'name':'','location':'','email':'','phone':''},'sections':[{'title':k,'entries':v} for k,v in sections.items()],'content_items':[{'id':i.id,'title':i.title} for i in items.values()],'bullets':[{'id':b.id,'content_item_id':b.content_item_id,'text':b.text,'supporting_facts':b.supporting_facts,'is_locked':b.is_locked} for b in bullets.values()],'entries':[{'content_item_id':e.content_item_id,'bullet_ids':e.selected_bullet_ids} for e in entries]}
 @app.get("/applications/{id}/snapshot")
 def snapshot(id:int,s:Session=Depends(db)):

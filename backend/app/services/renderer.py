@@ -1,5 +1,6 @@
 """Deterministic structured resume rendering and PDF compilation."""
 from __future__ import annotations
+import os
 import shutil, subprocess
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,14 @@ class ResumeRenderer:
         tex_path.write_text(self.render_tex(snapshot), encoding="utf-8")
         if shutil.which(latexmk) is None:
             raise RuntimeError("latexmk is not installed")
-        result = subprocess.run([latexmk, "-pdf", "-interaction=nonstopmode", "-halt-on-error", "-outdir=" + str(out), str(tex_path)], text=True, capture_output=True)
+        # TinyTeX may need to generate bitmap fonts while compiling. Keep its
+        # writable cache beside this revision so local builds do not depend on
+        # permissions for the user's global TEXMFVAR directory.
+        texmf_var = out / "texmf-var"
+        texmf_var.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment["TEXMFVAR"] = str(texmf_var)
+        result = subprocess.run([latexmk, "-pdf", "-interaction=nonstopmode", "-halt-on-error", "-outdir=" + str(out), str(tex_path)], text=True, capture_output=True, env=environment)
         if result.returncode or not pdf_path.exists():
             raise RuntimeError("LaTeX compilation failed:\n" + result.stdout[-4000:] + result.stderr[-2000:])
         return tex_path, pdf_path

@@ -13,7 +13,7 @@
 {% for section in resume.sections|default([]) %}
 \section*{ {{ section.title|latex }} }
 {% for entry in section.entries|default([]) %}
-\textbf{ {{ entry.title|latex }} } \hfill {{ entry.dates|default('')|latex }}\\
+\textbf{ {{ entry.title|latex }} }{% if entry.skills|default('', true) %} $|$ \textit{ {{ entry.skills|latex }} }}{% endif %} \hfill {{ entry.dates|default('')|latex }}\\
 \textit{ {{ entry.organization|default('')|latex }} }{% if entry.location|default('', true) %} \hfill {{ entry.location|default('')|latex }}{% endif %}
 \begin{itemize}[leftmargin=*]
 {% for bullet in entry.bullets|default([]) %}\resumeItem{ {{ bullet.text|latex }} }
