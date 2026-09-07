@@ -19,4 +19,6 @@ def proposal_prompt(context: dict[str, Any]) -> str:
     return COMMON + f"""Operation: generate_proposal. Schema version: {SCHEMA_VERSION}.
 Select only supplied entry/bullet IDs. Propose rewrites only when directly supported by the
 verified evidence for that bullet. Locked bullets must not be changed. Unresolved confirmations
-must remain warnings and must never become claims. Context JSON follows:\n---\n{json.dumps(context, ensure_ascii=False, sort_keys=True)}\n---"""
+must remain warnings and must never become claims. selected_entries is the complete final resume
+selection in base section order. Always preserve every base Education and Activities entry.
+Context JSON follows:\n---\n{json.dumps(context, ensure_ascii=False, sort_keys=True)}\n---"""

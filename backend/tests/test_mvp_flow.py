@@ -83,7 +83,7 @@ def test_full_tailoring_flow_and_revision_artifacts():
     proposal_id = proposal.json()["id"]
     assert client.post(f"/proposals/{proposal_id}/approve").status_code == 200
 
-    generated = client.post(f"/applications/{application['id']}/generate")
+    generated = client.post(f"/applications/{application['id']}/generate",json={"proposal_id":proposal_id})
     assert generated.status_code == 200
     revision = generated.json()
     assert revision["revision_number"] == 1
@@ -128,7 +128,7 @@ def test_revision_is_immutable_after_source_edit():
         json={"payload": {"selected_entries": [{"content_item_id": item["id"], "bullet_ids": [bullet["id"]]}], "bullet_changes": []}},
     ).json()
     assert client.post(f"/proposals/{proposal['id']}/approve").status_code == 200
-    generated = client.post(f"/applications/{application['id']}/generate")
+    generated = client.post(f"/applications/{application['id']}/generate",json={"proposal_id":proposal["id"]})
     assert generated.status_code == 200
     first = generated.json()
 

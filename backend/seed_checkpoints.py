@@ -1,6 +1,7 @@
 """Replace demo records with the real resumes stored in ``checkpoints``."""
 from __future__ import annotations
 
+import argparse
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,23 @@ def clean(value: str) -> str:
     value = value.replace("{", "").replace("}", "").replace("$", "")
     return re.sub(r"\s+", " ", value).strip(" \\:")
 
+def parse_contact(path: Path) -> dict[str,str]:
+    text=path.read_text(errors="replace")
+    center=re.search(r"\\begin\{center\}(.*?)\\end\{center\}",text,re.S)
+    block=center.group(1) if center else text
+    name_match=re.search(r"\\textbf\{\\Huge(?:\s+\\scshape)?\s+([^}]+)\}",block)
+    email_match=re.search(r"mailto:([^}]+)",block)
+    linkedin_match=re.search(r"https?://(?:www\.)?linkedin\.com/[^}\s]+",block)
+    phone_match=re.search(r"(?:\(\d{3}\)\s*\d{3}-\d{4}|\d{3}-\d{3}-\d{4})",block)
+    location_match=re.search(r"\\small\s+([^$\\\n]+?)\s*\$\|\$",block)
+    contact={"name":clean(name_match.group(1)) if name_match else "",
+        "location":clean(location_match.group(1)) if location_match else "",
+        "email":email_match.group(1) if email_match else "","phone":phone_match.group(0) if phone_match else ""}
+    if linkedin_match:
+        contact["linkedin"]=linkedin_match.group(0)
+        contact["linkedin_label"]=contact["linkedin"].removeprefix("https://").removeprefix("http://").rstrip("/")
+    return contact
+
 def parse_resume(path: Path) -> list[dict]:
     text = path.read_text(errors="replace")
     sections = list(re.finditer(r"\\section\{([^}]+)\}", text)); records = []
@@ -86,9 +104,11 @@ def seed() -> None:
         for folder in folders:
             slug, is_primary = folder.name, folder.name == PRIMARY
             pdf_file = next(iter(sorted(folder.glob("*.pdf"))))
+            owner = "Vishwa Pandya" if slug.startswith("vishwa-") else "Shiven Pandya"
             base = BaseResume(name=DISPLAY_NAMES.get(slug, slug.replace("-", " ").title()), template_id="latex-checkpoint",
-                section_order=[], layout_settings={"primary": is_primary, "owner": "Vishwa Pandya" if slug.startswith("vishwa-") else "Shiven Pandya",
-                "checkpoint": slug, "pdf_path": pdf_file.relative_to(ROOT).as_posix()})
+                section_order=[], layout_settings={"primary": is_primary, "owner":owner,
+                "contact":parse_contact(folder/"resume.tex"),"checkpoint": slug,
+                "pdf_path": pdf_file.relative_to(ROOT).as_posix()})
             session.add(base); session.flush(); bases[slug] = base; section_order = []
             for order, record in enumerate(parse_resume(folder / "resume.tex")):
                 item_type = record.get("type", "other")
@@ -97,7 +117,9 @@ def seed() -> None:
                 item = ContentItem(**record, tags=[f"checkpoint:{slug}"], is_archived=False)
                 session.add(item); session.flush(); bullet_ids = []
                 for text in bullets:
-                    bullet = Bullet(content_item_id=item.id, text=text, tags=[f"checkpoint:{slug}"], supporting_facts=[], is_locked=True, is_preferred=is_primary)
+                    verified=owner=="Shiven Pandya"
+                    bullet = Bullet(content_item_id=item.id, text=text, tags=[f"checkpoint:{slug}"],
+                        supporting_facts=[text] if verified else [],is_locked=not verified,is_preferred=is_primary)
                     session.add(bullet); session.flush(); bullet_ids.append(bullet.id)
                 session.add(BaseEntry(base_resume_id=base.id, content_item_id=item.id, selected_bullet_ids=bullet_ids, entry_order=order))
             base.section_order = section_order
@@ -109,4 +131,58 @@ def seed() -> None:
         session.add(app); session.flush(); session.add(JobAnalysis(application_id=app.id, **analyze_text(details)))
         session.commit(); print(f"Imported {len(folders)} resumes; primary is {DISPLAY_NAMES[PRIMARY]}.")
 
-if __name__ == "__main__": seed()
+def migrate_verified() -> None:
+    """Backfill checkpoint metadata without replacing existing database records."""
+    updated=0
+    # ``begin`` makes the migration all-or-nothing.  In particular, a bad
+    # checkpoint must not leave contact metadata committed while the evidence
+    # backfill is only partially complete.
+    with SessionLocal.begin() as session:
+        for base in session.query(BaseResume).all():
+            settings=dict(base.layout_settings or {})
+            slug=settings.get("checkpoint")
+            if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", slug):
+                continue
+            folder=CHECKPOINTS / slug
+            # The checkpoint marker and an on-disk resume are both required;
+            # do not accept arbitrary paths from layout_settings.
+            if not folder.is_dir() or not (folder / "resume.tex").is_file():
+                continue
+            # Presence, rather than truthiness, is the migration marker.  An
+            # intentionally empty parsed contact must not be reprocessed on
+            # every invocation.
+            if "contact" not in settings:
+                settings["contact"]=parse_contact(folder / "resume.tex")
+                base.layout_settings=settings
+                updated+=1
+
+            # Ownership is an explicit importer fact.  A contact name is user
+            # editable data and must never be used to infer source ownership.
+            if settings.get("owner") != "Shiven Pandya":
+                continue
+            checkpoint_tag=f"checkpoint:{slug}"
+            item_ids={entry.content_item_id for entry in session.query(BaseEntry).filter_by(base_resume_id=base.id)}
+            items=session.query(ContentItem).filter(ContentItem.id.in_(item_ids)).all() if item_ids else []
+            for item in items:
+                # Only records positively tied to this checkpoint may be
+                # rewritten.  This protects hand-created/library content that
+                # happens to be selected by a checkpoint base resume.
+                if checkpoint_tag not in (item.tags or []):
+                    continue
+                for bullet in item.bullets:
+                    if checkpoint_tag not in (bullet.tags or []):
+                        continue
+                    evidence=list(bullet.supporting_facts or [])
+                    if not evidence:
+                        evidence=[bullet.text]
+                    if evidence != list(bullet.supporting_facts or []) or bullet.is_locked:
+                        bullet.supporting_facts=evidence
+                        bullet.is_locked=False
+                        updated+=1
+    print(f"Migrated {updated} verified checkpoint records.")
+
+if __name__ == "__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--migrate-verified",action="store_true")
+    args=parser.parse_args()
+    migrate_verified() if args.migrate_verified else seed()

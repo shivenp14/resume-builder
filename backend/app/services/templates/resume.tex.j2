@@ -1,23 +1,89 @@
 \documentclass[letterpaper,11pt]{article}
+\usepackage{latexsym}
 \usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
 \usepackage{enumitem}
 \usepackage[hidelinks]{hyperref}
-\usepackage[T1]{fontenc}
-\pagestyle{empty}\setlength{\parindent}{0pt}
-\newcommand{\resumeItem}[1]{\item\small{ {{ '#1' }} }}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\input{glyphtounicode}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+\titleformat{\section}{\vspace{-4pt}\scshape\raggedright\large}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+\pdfgentounicode=1
+{% raw %}
+\newcommand{\resumeItem}[1]{\item\small{{#1 \vspace{-2pt}}}}
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & #2 \\
+    \textit{\small#3} & \textit{\small #4} \\
+  \end{tabular*}\vspace{-7pt}}
+\newcommand{\resumeProjectHeading}[2]{
+  \item
+  \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+    \small#1 & #2 \\
+  \end{tabular*}\vspace{-7pt}}
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in,label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+{% endraw %}
 \begin{document}
 \begin{center}
-{\Large\textbf{ {{ resume.contact.name|latex }} }}\\
-{{ resume.contact.location|default('')|latex }} $|$ {{ resume.contact.email|default('')|latex }} $|$ {{ resume.contact.phone|default('')|latex }}
+  \textbf{\Huge \scshape {{ resume.contact.name|default('')|latex }}} \\ \vspace{1pt}
+  {\small {% set contact = namespace(has_value=false) %}{% if resume.contact.location|default('') %}{{ resume.contact.location|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.phone|default('') %}{% if contact.has_value %} $|$ {% endif %}{{ resume.contact.phone|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.email|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{mailto:{{ resume.contact.email|latex }}}{\underline{ {{ resume.contact.email|latex }} }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.linkedin|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{ {{ resume.contact.linkedin|latex }} }{\underline{ {{ resume.contact.linkedin_label|default(resume.contact.linkedin)|latex }} }}{% endif %}}
 \end{center}
 {% for section in resume.sections|default([]) %}
-\section*{ {{ section.title|latex }} }
+{% set section_key = section.key|default(section.title|lower) %}
+\section{ {{ section.title|latex }} }
+{% if section_key == 'skills' %}
+\begin{itemize}[leftmargin=0.15in,label={}]
+  \small{\item{% for group in section.skill_groups|default([]) %}\textbf{ {{ group.category|latex }} }{: {{ group.skills|join(', ')|latex }}}{% if not loop.last %} \\{% endif %}{% endfor %}}
+\end{itemize}
+{% elif section_key in ['objective','professional summary','professional_summary'] %}
+{% for entry in section.entries|default([]) %}{% if entry.summary|default('') %}\small{ {{ entry.summary|latex }} }{% endif %}{% for bullet in entry.bullets|default([]) %}\resumeItemListStart
+\resumeItem{ {{ bullet.text|latex }} }
+\resumeItemListEnd{% endfor %}{% endfor %}
+{% elif section_key == 'activities' %}
+\begin{itemize}[leftmargin=0.15in,label={}]
+{% for entry in section.entries|default([]) %}{% if entry.title|default('') and entry.summary|default('') %}\item\small{\textbf{ {{ entry.title|latex }} }: {{ entry.summary|latex }}}
+{% elif entry.title|default('') %}\item\small{ {{ entry.title|latex }} }
+{% elif entry.summary|default('') %}\item\small{ {{ entry.summary|latex }} }
+{% endif %}{% for bullet in entry.bullets|default([]) %}\item\small{ {{ bullet.text|latex }} }
+{% endfor %}{% endfor %}\end{itemize}
+{% else %}
+\resumeSubHeadingListStart
 {% for entry in section.entries|default([]) %}
-\textbf{ {{ entry.title|latex }} }{% if entry.skills|default('', true) %} $|$ \textit{ {{ entry.skills|latex }} }}{% endif %} \hfill {{ entry.dates|default('')|latex }}\\
-\textit{ {{ entry.organization|default('')|latex }} }{% if entry.location|default('', true) %} \hfill {{ entry.location|default('')|latex }}{% endif %}
-\begin{itemize}[leftmargin=*]
+{% if section_key == 'project' %}
+\resumeProjectHeading{\textbf{ {{ entry.title|latex }} }{% if entry.skills|default('') %} $|$ \emph{ {{ entry.skills|latex }} }{% endif %}}{ {{ entry.dates|default('')|latex }} }
+{% elif section_key == 'education' %}
+\resumeSubheading{ {{ entry.organization|default(entry.title, true)|latex }} }{ {{ entry.location|default('')|latex }} }{ {{ entry.display_title|default(entry.title)|latex }} }{ {{ entry.dates|default('')|latex }} }
+{% else %}
+\resumeSubheading{ {{ entry.organization|default(entry.title, true)|latex }} }{ {{ entry.dates|default('')|latex }} }{ {{ entry.display_title|default(entry.title)|latex }} }{ {{ entry.location|default('')|latex }} }
+{% endif %}
+{% if entry.summary|default('') or entry.bullets|default([]) %}\resumeItemListStart
+{% if entry.summary|default('') %}\resumeItem{ {{ entry.summary|latex }} }
+{% endif %}
 {% for bullet in entry.bullets|default([]) %}\resumeItem{ {{ bullet.text|latex }} }
-{% endfor %}\end{itemize}
+{% endfor %}\resumeItemListEnd{% endif %}
 {% endfor %}
+\resumeSubHeadingListEnd
+{% endif %}
 {% endfor %}
 \end{document}

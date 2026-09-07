@@ -30,10 +30,45 @@ def test_analysis_and_immutable_revision_numbers():
     }).json()
     analysis = client.post(f"/applications/{application['id']}/analyze").json()
     assert set(analysis['technologies']) == {'python','docker'}
-    first = client.post(f"/applications/{application['id']}/revisions", json={'resume_json':{'x':1}}).json()
-    second = client.post(f"/applications/{application['id']}/revisions", json={'resume_json':{'x':2}}).json()
+    snapshot = {'content_items': [], 'bullets': [], 'entries': [], 'sections': [], 'contact': {}}
+    first = client.post(f"/applications/{application['id']}/revisions", json={'resume_json':snapshot}).json()
+    second = client.post(f"/applications/{application['id']}/revisions", json={'resume_json':snapshot}).json()
     assert (first['revision_number'], second['revision_number']) == (1,2)
-    assert client.get(f"/applications/{application['id']}/revisions").json()[0]['resume_json'] == {'x':1}
+    assert client.get(f"/applications/{application['id']}/revisions").json()[0]['resume_json'] == snapshot
+
+def test_reference_integrity_and_revision_shape():
+    first = client.post('/content-items', json={'type':'experience','title':'First'}).json()
+    second = client.post('/content-items', json={'type':'experience','title':'Second'}).json()
+    bullet = client.post(f"/content-items/{first['id']}/bullets", json={'text':'Verified work'}).json()
+    resume = client.post('/base-resumes', json={'name':'Base'}).json()
+    entry = client.post(f"/base-resumes/{resume['id']}/entries", json={
+        'content_item_id':first['id'], 'selected_bullet_ids':[bullet['id']]
+    }).json()
+    assert client.patch(f"/base-entries/{entry['id']}", json={
+        'content_item_id':second['id'], 'selected_bullet_ids':[bullet['id']], 'entry_order':0
+    }).status_code == 422
+    assert client.delete(f"/bullets/{bullet['id']}").status_code == 409
+    application = client.post('/applications', json={
+        'company':'Test','position':'Role','job_description':'Python','base_resume_id':resume['id']
+    }).json()
+    assert client.post(f"/applications/{application['id']}/revisions", json={'resume_json':{'x':1}}).status_code == 422
+
+def test_openapi_contracts_and_missing_application_lists():
+    schema = client.get('/openapi.json').json()
+    assert schema['paths']['/applications']['get']['responses']['200']['content']['application/json']['schema']['type'] == 'array'
+    for path, method in [('/applications/{id}/comparison', 'get'), ('/applications/{id}/snapshot', 'get'), ('/applications/{id}/generate', 'post'), ('/render', 'post')]:
+        assert 'content' in schema['paths'][path][method]['responses']['200']
+    assert client.get('/applications/99999/proposals').status_code == 404
+    assert client.get('/applications/99999/revisions').status_code == 404
+    assert client.get('/applications/99999/missing-confirmations').status_code == 404
+
+def test_application_patch_rejects_invalid_required_fields_and_status():
+    resume = client.post('/base-resumes', json={'name':'Base'}).json()
+    application = client.post('/applications', json={
+        'company':'Test','position':'Role','job_description':'Python','base_resume_id':resume['id']
+    }).json()
+    assert client.patch(f"/applications/{application['id']}", json={'company':None}).status_code == 422
+    assert client.patch(f"/applications/{application['id']}", json={'status':'made-up'}).status_code == 422
 
 def test_render_endpoint_escapes_latex_and_accepts_structured_snapshot():
     response = client.post('/render', json={'snapshot': {

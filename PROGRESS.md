@@ -1,6 +1,6 @@
 # Backend Progress
 
-Updated: August 22, 2026
+Updated: August 23, 2026
 
 ## Done
 
@@ -14,6 +14,7 @@ Updated: August 22, 2026
 - [x] Resume-to-job comparison
 - [x] Missing-information confirmations
 - [x] Optimization proposal storage and decisions
+- [x] Approved-proposal materialization with source fingerprints and provenance
 - [x] Offline provider-injection tests for model configuration, failures, audit runs, and proposal validation
 - [x] Locked-bullet and source-ownership validation
 - [x] Basic unsupported-number validation
@@ -24,14 +25,15 @@ Updated: August 22, 2026
 - [x] Generated artifact storage and static routes
 - [x] Checkpoint resume and application importer
 - [x] OpenAPI documentation at `/docs`
-- [x] Backend test suite: 14/14 passing
+- [x] Baseline-template contact, education, project, skills, and activity rendering parity
+- [x] Backend test suite: 19/19 passing
 
 ## Remaining
 
 - [ ] Finalize and document stable API response schemas
 - [ ] Add personal-information records
 - [ ] Add content and bullet version history
-- [ ] Add claim provenance and supporting evidence
+- [x] Add claim provenance and supporting evidence
 - [ ] Add archive restore and duplication
 - [ ] Add normalized skill relationships and aliases
 - [ ] Expand application metadata and status history
@@ -45,7 +47,7 @@ Updated: August 22, 2026
 - [x] Generate evidence-grounded optimization proposals
 - [x] Store optimization runs and per-change decisions
 - [ ] Add revision comparison
-- [ ] Finalize baseline-template layout constraints and rendering parity
+- [x] Finalize baseline-template layout constraints and rendering parity
 - [ ] Improve LaTeX failure diagnostics
 - [ ] Add deterministic rendering tests
 - [ ] Add backup and export

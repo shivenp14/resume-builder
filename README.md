@@ -17,6 +17,20 @@ return `503` without creating partial analysis or proposal records.
 The provider can be replaced with an injected fake in tests, so the test suite
 does not make network calls or depend on a Codex session.
 
+Approved proposals are applied only when generation receives their explicit
+ID. A proposal must belong to the application, remain current with its source
+fingerprint, and pass the evidence and ownership checks again before rendering:
+
+```http
+POST /applications/{application_id}/generate
+Content-Type: application/json
+
+{"proposal_id": 123}
+```
+
+Generation materializes an immutable tailored snapshot; it never edits the
+verified content library or base resume records.
+
 Frontend development is intentionally deferred. The current project scope is
 the backend data model, API contracts, validation, matching, revision history,
 and rendering every resume through the canonical baseline LaTeX template to
@@ -50,7 +64,14 @@ The checkpoint importer replaces the local database contents with the resumes
 and application data stored under `checkpoints/`:
 
 ```bash
-backend/.venv/bin/python backend/seed_checkpoints.py
+backend/.venv/bin/python -m backend.seed_checkpoints
+```
+
+To non-destructively backfill contact metadata and mark Shiven's verified
+checkpoint bullets as evidence-backed and rewriteable:
+
+```bash
+backend/.venv/bin/python -m backend.seed_checkpoints --migrate-verified
 ```
 
 ## Generated artifacts

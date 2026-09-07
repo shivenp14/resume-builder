@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resume Builder Backend Completion Report</title>
+  <style>
+    :root { color-scheme: light; --ink:#17202a; --muted:#5c6875; --line:#d9e0e7; --panel:#f6f8fa; --accent:#2457a6; --warn:#8a4b08; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#fff; color:var(--ink); font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:980px; margin:0 auto; padding:42px 24px 64px; }
+    h1 { margin:0 0 8px; font-size:2rem; line-height:1.15; }
+    h2 { margin:34px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:1.25rem; }
+    h3 { margin:22px 0 6px; font-size:1rem; }
+    p { margin:8px 0 12px; }
+    ul, ol { margin:8px 0 14px 22px; padding:0; }
+    li { margin:5px 0; }
+    .meta { color:var(--muted); margin-bottom:24px; }
+    .summary { padding:16px 18px; background:var(--panel); border-left:4px solid var(--accent); }
+    .status { display:inline-block; padding:3px 9px; border-radius:999px; background:#fff0df; color:var(--warn); font-weight:650; }
+    code { padding:1px 4px; background:#f0f3f6; border-radius:3px; font-size:.92em; }
+    table { width:100%; border-collapse:collapse; margin:10px 0 18px; }
+    th, td { padding:9px 10px; border:1px solid var(--line); vertical-align:top; text-align:left; }
+    th { background:var(--panel); font-weight:650; }
+    .priority { width:100px; white-space:nowrap; font-weight:700; }
+    .note { color:var(--muted); font-size:.94rem; }
+    footer { margin-top:36px; padding-top:14px; border-top:1px solid var(--line); color:var(--muted); font-size:.9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Resume Builder Backend Completion Report</h1>
+    <p class="meta">Generated 2026-09-07 · Audit model: GPT-5.6 Luna · Repository: <code>resume-builder</code></p>
+
+    <section class="summary">
+      <strong>Overall:</strong> The core local-first backend flow is implemented: verified content and bullets, base resumes, applications, Codex-backed analysis, comparison and missing confirmations, evidence-grounded proposals, approval gates, immutable tailored revisions, LaTeX rendering, PDF generation, generated artifact routes, and checkpoint import. The current implementation is close to an MVP handoff, but it needs reliability and data-integrity work before it can be considered complete.
+    </section>
+
+    <h2>Current status</h2>
+    <p><span class="status">18/19 tests passing</span> The remaining test failure is the full tailoring-flow artifact test: generated <code>page_count</code> is <code>None</code> because <code>pdfinfo</code> is missing in the environment. The exception is silently ignored in <code>backend/app/main.py:513-517</code>. Page-count behavior must be deterministic: declare/install <code>pdfinfo</code>, add a reliable fallback, or make null an explicit API contract.</p>
+
+    <h2>Immediate blockers</h2>
+    <table>
+      <thead><tr><th class="priority">Priority</th><th>Blocker</th><th>Evidence and impact</th></tr></thead>
+      <tbody>
+        <tr><td class="priority">P0</td><td>Deterministic page count</td><td><code>main.py:513-517</code> swallows all <code>pdfinfo</code> failures, producing null despite the test requiring a positive count.</td></tr>
+        <tr><td class="priority">P0</td><td>Activities bullets are dropped</td><td>The canonical template special-cases activities at <code>backend/app/services/templates/resume.tex.j2:59-60</code> and renders only <code>entry.summary</code>. Activity bullets collected in the snapshot are never emitted.</td></tr>
+        <tr><td class="priority">P0</td><td>Strict API DTOs</td><td>Most routes have no <code>response_model</code>; proposals, revisions, confirmations, and provider results use broad dictionaries. Stable request/response schemas and strict validation are still required.</td></tr>
+        <tr><td class="priority">P0</td><td>Reference integrity</td><td><code>PATCH /base-entries/{id}</code> at <code>main.py:165-170</code> does not revalidate item/bullet ownership. <code>DELETE /bullets/{id}</code> at <code>main.py:125-129</code> does not reject referenced bullets, allowing dangling base-entry references.</td></tr>
+        <tr><td class="priority">P0</td><td>Migration and database safety</td><td>The app relies on <code>Base.metadata.create_all(engine)</code> at <code>main.py:64</code>; there is no migration/versioning path for existing SQLite databases, no explicit SQLite foreign-key enforcement, and no transactional schema upgrade process.</td></tr>
+        <tr><td class="priority">P1</td><td>Revision numbering concurrency</td><td><code>count()+1</code> is used at <code>main.py:485</code> and <code>main.py:508</code> without a unique constraint or transaction-safe allocator. Concurrent generations can collide in revision numbers and artifact paths.</td></tr>
+        <tr><td class="priority">P1</td><td>Fingerprint completeness</td><td>The source fingerprint at <code>main.py:216-221</code> does not include skill state, although verified skills are inserted into every snapshot at <code>main.py:440-451</code>. Skill edits can therefore leave an approved proposal appearing fresh.</td></tr>
+        <tr><td class="priority">P1</td><td>Arbitrary manual revisions</td><td><code>POST /applications/{id}/revisions</code> accepts any JSON that lacks <code>content_items</code>, <code>bullets</code>, and <code>entries</code> (<code>main.py:479-486</code>), so non-resume payloads can be persisted as revisions.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Planned backend features still outstanding</h2>
+    <p>The remaining checklist is recorded in <code>PROGRESS.md:33-53</code>:</p>
+    <ul>
+      <li>Finalize and document stable API response schemas.</li>
+      <li>Add personal-information records.</li>
+      <li>Add content and bullet version history.</li>
+      <li>Add archive restore and duplication.</li>
+      <li>Add normalized skill relationships and aliases.</li>
+      <li>Expand application metadata and status history.</li>
+      <li>Add application update, filtering, search, and pagination.</li>
+      <li>Add submitted-revision tracking.</li>
+      <li>Add structured job requirements and evidence links.</li>
+      <li>Improve matching classifications and scoring.</li>
+      <li>Turn confirmed missing information into verified source records.</li>
+      <li>Add revision comparison.</li>
+      <li>Improve LaTeX failure diagnostics.</li>
+      <li>Add deterministic rendering tests.</li>
+      <li>Add backup and export.</li>
+    </ul>
+
+    <h2>Scope clarification</h2>
+    <p>Frontend development is explicitly deferred in <code>README.md:34-38</code>. No frontend exists in the repository; the current scope is the backend data model, API contracts, validation, matching, revision history, and canonical LaTeX/PDF rendering.</p>
+
+    <h2>Recommended completion phases</h2>
+    <ol>
+      <li><strong>Make the MVP green:</strong> fix deterministic page counts, restore activity bullet rendering, and add coverage for all canonical sections.</li>
+      <li><strong>Harden contracts and persistence:</strong> add Pydantic DTOs, response models, strict proposal/revision validation, migrations, SQLite foreign keys, ownership checks, safe deletion rules, and transaction-safe revision numbering.</li>
+      <li><strong>Complete application lifecycle:</strong> add application updates, status history, search/filter/pagination, structured requirements/evidence links, submitted-revision tracking, and real matching scores.</li>
+      <li><strong>Complete source-library workflows:</strong> add personal records, content/bullet history, archive restore/duplication, normalized skill relationships, and conversion of confirmed information into verified records.</li>
+      <li><strong>Finish operational quality:</strong> add revision comparison, actionable renderer diagnostics, deterministic rendering tests, backup/export, and document the stable API.</li>
+    </ol>
+
+    <footer>Audit artifact only; no source files were changed by this report.</footer>
+  </main>
+</body>
+</html>
