@@ -102,6 +102,10 @@ def test_migration_requires_explicit_owner_and_checkpoint_tag(migration_db):
         assert untagged_bullet.is_locked is True
         assert untagged_bullet_record.supporting_facts == []
         assert untagged_bullet_record.is_locked is True
+        owned_history = session.query(main.BulletVersion).filter_by(bullet_id=owned[2]).all()
+        assert len(owned_history) == 1
+        assert owned_history[0].action == "updated"
+        assert owned_history[0].snapshot["supporting_facts"] == [owned_bullet.text]
 
 
 def test_migration_is_idempotent_and_rewrites_locked_evidence_backed_bullets(migration_db):
@@ -119,6 +123,7 @@ def test_migration_is_idempotent_and_rewrites_locked_evidence_backed_bullets(mig
         assert bullet.supporting_facts == ["Existing evidence"]
         assert bullet.is_locked is False
         assert base.layout_settings["contact"]["name"] == "Shiven Pandya"
+        assert session.query(main.BulletVersion).filter_by(bullet_id=bullet_id).count() == 1
 
     # A second invocation must not mutate or duplicate evidence/contact data.
     seed_checkpoints.migrate_verified()
@@ -128,6 +133,7 @@ def test_migration_is_idempotent_and_rewrites_locked_evidence_backed_bullets(mig
         assert bullet.supporting_facts == ["Existing evidence"]
         assert bullet.is_locked is False
         assert base.layout_settings["contact"]["name"] == "Shiven Pandya"
+        assert session.query(main.BulletVersion).filter_by(bullet_id=bullet_id).count() == 1
 
 
 def test_migration_rolls_back_all_changes_on_failure(migration_db, monkeypatch):
