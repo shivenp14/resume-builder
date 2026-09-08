@@ -70,19 +70,121 @@ class MissingConfirmation(Base):
 class OptimizationRun(Base):
     __tablename__="optimization_runs"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); operation: Mapped[str]=mapped_column(String(40)); status: Mapped[str]=mapped_column(String(20),default="running"); model: Mapped[str]=mapped_column(String(100),default="gpt-5.6-luna"); reasoning_effort: Mapped[str]=mapped_column(String(20),default="low"); prompt_version: Mapped[str]=mapped_column(String(40),default="v1"); schema_version: Mapped[str]=mapped_column(String(40),default="v1"); idempotency_key: Mapped[str|None]=mapped_column(String(200)); input_payload: Mapped[dict]=mapped_column(JSON,default=dict); output_payload: Mapped[dict|None]=mapped_column(JSON); error: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
+class ContentItemVersion(Base):
+    """Immutable point-in-time copy of a content item.
+
+    This table deliberately does not have a foreign key to ``content_items``:
+    a history row must remain readable even if a future maintenance workflow
+    permanently removes its source row.
+    """
+    __tablename__="content_item_versions"
+    __table_args__=(UniqueConstraint("content_item_id", "version_number", name="uq_content_item_version_number"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    content_item_id: Mapped[int]=mapped_column(Integer,index=True)
+    version_number: Mapped[int]=mapped_column(Integer)
+    action: Mapped[str]=mapped_column(String(30))
+    type: Mapped[str]=mapped_column(String(40))
+    title: Mapped[str]=mapped_column(String(200))
+    organization: Mapped[str|None]=mapped_column(String(200))
+    location: Mapped[str|None]=mapped_column(String(200))
+    start_date: Mapped[str|None]=mapped_column(String(30))
+    end_date: Mapped[str|None]=mapped_column(String(30))
+    summary: Mapped[str|None]=mapped_column(Text)
+    tags: Mapped[list]=mapped_column(JSON,default=list)
+    is_archived: Mapped[bool]=mapped_column(Boolean,default=False)
+    changed_fields: Mapped[list]=mapped_column(JSON,default=list)
+    snapshot: Mapped[dict]=mapped_column(JSON,default=dict)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+class BulletVersion(Base):
+    """Immutable point-in-time copy of a bullet, including deleted bullets."""
+    __tablename__="bullet_versions"
+    __table_args__=(UniqueConstraint("bullet_id", "version_number", name="uq_bullet_version_number"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    bullet_id: Mapped[int]=mapped_column(Integer,index=True)
+    content_item_id: Mapped[int]=mapped_column(Integer,index=True)
+    version_number: Mapped[int]=mapped_column(Integer)
+    action: Mapped[str]=mapped_column(String(30))
+    text: Mapped[str]=mapped_column(Text)
+    tags: Mapped[list]=mapped_column(JSON,default=list)
+    supporting_facts: Mapped[list]=mapped_column(JSON,default=list)
+    is_locked: Mapped[bool]=mapped_column(Boolean,default=False)
+    is_preferred: Mapped[bool]=mapped_column(Boolean,default=False)
+    changed_fields: Mapped[list]=mapped_column(JSON,default=list)
+    snapshot: Mapped[dict]=mapped_column(JSON,default=dict)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 Base.metadata.create_all(engine)
 
+_CONTENT_VERSION_FIELDS=("type","title","organization","location","start_date","end_date","summary","tags","is_archived")
+_BULLET_VERSION_FIELDS=("text","tags","supporting_facts","is_locked","is_preferred")
+
+def _iso(value: datetime|None) -> str|None:
+    return value.isoformat() if value else None
+
+def _content_snapshot(item: ContentItem) -> dict[str,Any]:
+    return {"id":item.id,"type":item.type,"title":item.title,"organization":item.organization,
+        "location":item.location,"start_date":item.start_date,"end_date":item.end_date,
+        "summary":item.summary,"tags":list(item.tags or []),"is_archived":bool(item.is_archived),
+        "created_at":_iso(item.created_at),"updated_at":_iso(item.updated_at)}
+
+def _bullet_snapshot(bullet: Bullet) -> dict[str,Any]:
+    return {"id":bullet.id,"content_item_id":bullet.content_item_id,"text":bullet.text,
+        "tags":list(bullet.tags or []),"supporting_facts":list(bullet.supporting_facts or []),
+        "is_locked":bool(bullet.is_locked),"is_preferred":bool(bullet.is_preferred)}
+
+def _append_content_version(s: Session, item: ContentItem, *, action: str, changed_fields: list[str]) -> ContentItemVersion:
+    """Append a source snapshot; callers must commit the enclosing mutation."""
+    number=(s.query(func.max(ContentItemVersion.version_number))
+        .filter_by(content_item_id=item.id).scalar() or 0)+1
+    snapshot=_content_snapshot(item)
+    version=ContentItemVersion(content_item_id=item.id,version_number=number,action=action,
+        type=item.type,title=item.title,organization=item.organization,location=item.location,
+        start_date=item.start_date,end_date=item.end_date,summary=item.summary,
+        tags=list(item.tags or []),is_archived=bool(item.is_archived),
+        changed_fields=list(changed_fields),snapshot=snapshot,created_at=now())
+    s.add(version)
+    return version
+
+def _append_bullet_version(s: Session, bullet: Bullet, *, action: str, changed_fields: list[str]) -> BulletVersion:
+    number=(s.query(func.max(BulletVersion.version_number))
+        .filter_by(bullet_id=bullet.id).scalar() or 0)+1
+    snapshot=_bullet_snapshot(bullet)
+    version=BulletVersion(bullet_id=bullet.id,content_item_id=bullet.content_item_id,
+        version_number=number,action=action,text=bullet.text,tags=list(bullet.tags or []),
+        supporting_facts=list(bullet.supporting_facts or []),is_locked=bool(bullet.is_locked),
+        is_preferred=bool(bullet.is_preferred),changed_fields=list(changed_fields),
+        snapshot=snapshot,created_at=now())
+    s.add(version)
+    return version
+
 def _apply_sqlite_integrity_migrations() -> None:
-    """Apply additive indexes to databases created before the table constraints.
+    """Apply additive indexes and source-history backfills.
 
     SQLAlchemy's ``create_all`` never alters an existing SQLite table.  These
-    indexes make the revision/base-entry uniqueness guarantees effective for
-    both new and already-initialized local databases without destructive table
-    rebuilds.
+    indexes and history tables make the integrity and audit guarantees
+    effective for both new and already-initialized local databases without
+    destructive table rebuilds.
     """
+    # ``create_all`` is intentionally additive.  This also makes the migration
+    # safe to call against a database created by an older application version.
+    Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_application_number_idx ON revisions (application_id, revision_number)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_base_entry_resume_item_idx ON base_entries (base_resume_id, content_item_id)"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_content_item_version_number_idx ON content_item_versions (content_item_id, version_number)"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_bullet_version_number_idx ON bullet_versions (bullet_id, version_number)"))
+
+    # Older databases have source rows but no history.  Seed one immutable
+    # baseline snapshot per row; the existence check makes this backfill
+    # idempotent and never rewrites existing history.
+    MigrationSession=sessionmaker(bind=engine,expire_on_commit=False)
+    with MigrationSession() as session:
+        for item in session.query(ContentItem).all():
+            if not session.query(ContentItemVersion.id).filter_by(content_item_id=item.id).first():
+                _append_content_version(session,item,action="backfill",changed_fields=list(_CONTENT_VERSION_FIELDS))
+        for bullet in session.query(Bullet).all():
+            if not session.query(BulletVersion.id).filter_by(bullet_id=bullet.id).first():
+                _append_bullet_version(session,bullet,action="backfill",changed_fields=list(_BULLET_VERSION_FIELDS))
+        session.commit()
 
 _apply_sqlite_integrity_migrations()
 def db():
@@ -133,12 +235,24 @@ class RevisionOut(APIOut):
 class ConfirmationOut(APIOut): id:int; application_id:int; requirement:str; status:str; context:dict[str,Any]; created_at:datetime
 class OptimizationRunOut(APIOut):
     id:int; application_id:int; operation:str; status:str; model:str; reasoning_effort:str; prompt_version:str; schema_version:str; idempotency_key:str|None; input_payload:dict[str,Any]; output_payload:dict[str,Any]|None; error:str|None; created_at:datetime; completed_at:datetime|None
+class ContentItemVersionOut(APIOut):
+    id:int; content_item_id:int; version_number:int; version:int; action:str; type:str; title:str; organization:str|None; location:str|None; start_date:str|None; end_date:str|None; summary:str|None; tags:list[str]; is_archived:bool; changed_fields:list[str]; snapshot:dict[str,Any]; created_at:datetime
+class BulletVersionOut(APIOut):
+    id:int; bullet_id:int; content_item_id:int; version_number:int; version:int; action:str; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool; changed_fields:list[str]; snapshot:dict[str,Any]; created_at:datetime
 class ComparisonOut(APIOut):
     well_represented:list[str]; weakly_represented:list[str]; library_only:list[str]; unsupported:list[dict[str,str]]
 class SnapshotOut(APIOut):
     contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; provenance:dict[str,Any]|None=None
 class GenerationOut(RevisionOut): proposal_id:int; latex_url:str; pdf_url:str
 class RenderOut(APIOut): latex:str
+
+def _content_version_response(version: ContentItemVersion) -> dict[str,Any]:
+    return {column.name:getattr(version,column.name) for column in ContentItemVersion.__table__.columns} | {
+        "version":version.version_number}
+
+def _bullet_version_response(version: BulletVersion) -> dict[str,Any]:
+    return {column.name:getattr(version,column.name) for column in BulletVersion.__table__.columns} | {
+        "version":version.version_number}
 
 app=FastAPI(title="Resume Builder API",version="0.1.0")
 GENERATED = ROOT / "generated"
@@ -149,7 +263,9 @@ app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="che
 def health(): return {"status":"ok"}
 @app.post("/content-items",response_model=ContentItemOut)
 def create_item(x:ItemIn,s:Session=Depends(db)):
-    o=ContentItem(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
+    o=ContentItem(**x.model_dump()); s.add(o); s.flush()
+    _append_content_version(s,o,action="created",changed_fields=list(_CONTENT_VERSION_FIELDS))
+    s.commit(); s.refresh(o); return o
 @app.get("/content-items",response_model=list[ContentItemOut])
 def items(s:Session=Depends(db)): return s.query(ContentItem).filter_by(is_archived=False).all()
 @app.get("/content-items/{id}",response_model=ContentItemOut)
@@ -157,30 +273,70 @@ def item(id:int,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
     if not o: raise HTTPException(404,"content item not found")
     return o
+@app.get("/content-items/{id}/versions",response_model=list[ContentItemVersionOut])
+@app.get("/content-items/{id}/history",response_model=list[ContentItemVersionOut],include_in_schema=False)
+def content_item_versions(id:int,s:Session=Depends(db)):
+    records=s.query(ContentItemVersion).filter_by(content_item_id=id).order_by(ContentItemVersion.version_number).all()
+    if not records and not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
+    return [_content_version_response(record) for record in records]
+@app.get("/content-items/{id}/versions/{version_number}",response_model=ContentItemVersionOut)
+@app.get("/content-items/{id}/history/{version_number}",response_model=ContentItemVersionOut,include_in_schema=False)
+def content_item_version(id:int,version_number:int,s:Session=Depends(db)):
+    record=s.query(ContentItemVersion).filter_by(content_item_id=id,version_number=version_number).first()
+    if not record: raise HTTPException(404,"content item version not found")
+    return _content_version_response(record)
 @app.patch("/content-items/{id}",response_model=ContentItemOut)
 def edit_item(id:int,x:ItemPatch,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
     if not o: raise HTTPException(404,"content item not found")
-    for k,v in x.model_dump(exclude_unset=True).items(): setattr(o,k,v)
+    values=x.model_dump(exclude_unset=True)
+    changed=[k for k,v in values.items() if getattr(o,k)!=v]
+    for k,v in values.items(): setattr(o,k,v)
+    if changed:
+        o.updated_at=now()
+        s.flush()
+        _append_content_version(s,o,action="updated",changed_fields=changed)
     s.commit(); return o
 @app.delete("/content-items/{id}",response_model=MutationOut)
 def archive_item(id:int,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
     if not o: raise HTTPException(404,"content item not found")
-    o.is_archived=True; s.commit(); return {"archived":True}
+    if not o.is_archived:
+        o.is_archived=True; o.updated_at=now(); s.flush()
+        _append_content_version(s,o,action="archived",changed_fields=["is_archived"])
+    s.commit(); return {"archived":True}
 @app.post("/content-items/{id}/bullets",response_model=BulletOut)
 def add_bullet(id:int,x:BulletIn,s:Session=Depends(db)):
     if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
-    o=Bullet(content_item_id=id,**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
+    o=Bullet(content_item_id=id,**x.model_dump()); s.add(o); s.flush()
+    _append_bullet_version(s,o,action="created",changed_fields=list(_BULLET_VERSION_FIELDS))
+    s.commit(); s.refresh(o); return o
 @app.get("/content-items/{id}/bullets",response_model=list[BulletOut])
 def get_bullets(id:int,s:Session=Depends(db)):
     if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
     return s.query(Bullet).filter_by(content_item_id=id).all()
+@app.get("/bullets/{id}/versions",response_model=list[BulletVersionOut])
+@app.get("/bullets/{id}/history",response_model=list[BulletVersionOut],include_in_schema=False)
+def bullet_versions(id:int,s:Session=Depends(db)):
+    records=s.query(BulletVersion).filter_by(bullet_id=id).order_by(BulletVersion.version_number).all()
+    if not records and not s.get(Bullet,id): raise HTTPException(404,"bullet not found")
+    return [_bullet_version_response(record) for record in records]
+@app.get("/bullets/{id}/versions/{version_number}",response_model=BulletVersionOut)
+@app.get("/bullets/{id}/history/{version_number}",response_model=BulletVersionOut,include_in_schema=False)
+def bullet_version(id:int,version_number:int,s:Session=Depends(db)):
+    record=s.query(BulletVersion).filter_by(bullet_id=id,version_number=version_number).first()
+    if not record: raise HTTPException(404,"bullet version not found")
+    return _bullet_version_response(record)
 @app.patch("/bullets/{id}",response_model=BulletOut)
 def edit_bullet(id:int,x:BulletIn,s:Session=Depends(db)):
     o=s.get(Bullet,id)
     if not o: raise HTTPException(404,"bullet not found")
-    for k,v in x.model_dump().items(): setattr(o,k,v)
+    values=x.model_dump()
+    changed=[k for k,v in values.items() if getattr(o,k)!=v]
+    for k,v in values.items(): setattr(o,k,v)
+    if changed:
+        s.flush()
+        _append_bullet_version(s,o,action="updated",changed_fields=changed)
     s.commit(); return o
 @app.delete("/bullets/{id}",response_model=MutationOut)
 def delete_bullet(id:int,s:Session=Depends(db)):
@@ -189,6 +345,9 @@ def delete_bullet(id:int,s:Session=Depends(db)):
     references=[entry.id for entry in s.query(BaseEntry).all() if id in (entry.selected_bullet_ids or [])]
     if references:
         raise HTTPException(409,"bullet is selected by one or more base resume entries; remove it from those entries first")
+    # Append before deleting so the last state is retained.  History rows are
+    # intentionally not foreign-keyed and therefore survive this deletion.
+    _append_bullet_version(s,o,action="deleted",changed_fields=[])
     s.delete(o); s.commit(); return {"deleted":True}
 @app.post("/skills",response_model=SkillOut)
 def add_skill(x:SkillIn,s:Session=Depends(db)):
