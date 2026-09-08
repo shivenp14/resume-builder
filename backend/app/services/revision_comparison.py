@@ -20,6 +20,14 @@ _SEMANTIC_BULLET_FIELDS = (
     "was_rewritten",
 )
 _SEMANTIC_ITEM_FIELDS = ("title",)
+_SEMANTIC_RENDERED_ENTRY_FIELDS = (
+    "organization",
+    "location",
+    "dates",
+    "summary",
+    "skills",
+    "display_title",
+)
 
 
 def _key(value: Any) -> str:
@@ -67,6 +75,31 @@ def _normalized(value: Any) -> Any:
 
 def _semantic_record(record: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
     return {field: deepcopy(record.get(field)) for field in fields if field in record}
+
+
+def _rendered_entry_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index rendered section entries by source item without their bullets."""
+
+    records: list[dict[str, Any]] = []
+    sections = snapshot.get("sections")
+    if not isinstance(sections, list):
+        return {}
+    for section in sections:
+        if not isinstance(section, dict) or not isinstance(section.get("entries"), list):
+            continue
+        section_key = section.get("key") or section.get("title") or "section"
+        for entry in section["entries"]:
+            if not isinstance(entry, dict) or entry.get("content_item_id") is None:
+                continue
+            # A source item normally appears once.  Retain the section key so
+            # a move between sections is itself a meaningful visual change;
+            # the nested ``bullets`` list is intentionally not compared here.
+            records.append({
+                "content_item_id": entry["content_item_id"],
+                "section_key": str(section_key),
+                **{field: deepcopy(entry.get(field)) for field in _SEMANTIC_RENDERED_ENTRY_FIELDS if field in entry},
+            })
+    return _index(records, identity="content_item_id")
 
 
 def _change(kind: str, entity: str, record_id: str | None, path: str, before: Any, after: Any) -> dict[str, Any]:
@@ -171,6 +204,16 @@ def compare_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str
     added.extend(entry_changes[0])
     removed.extend(entry_changes[1])
     changed.extend(entry_changes[2])
+
+    rendered_entry_changes = _collection_changes(
+        _rendered_entry_index(before),
+        _rendered_entry_index(after),
+        entity="rendered_entry",
+        fields=("section_key", *_SEMANTIC_RENDERED_ENTRY_FIELDS),
+    )
+    added.extend(rendered_entry_changes[0])
+    removed.extend(rendered_entry_changes[1])
+    changed.extend(rendered_entry_changes[2])
 
     # Section order and headings affect the rendered document.  Compare the
     # stable layout fields only; section entries are represented by entries and

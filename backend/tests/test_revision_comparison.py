@@ -61,6 +61,46 @@ def test_semantic_diff_ignores_provenance_and_does_not_mutate_inputs():
     assert after == original_after
 
 
+def test_semantic_diff_captures_rendered_entry_metadata_without_bullet_noise():
+    before = {
+        "contact": {},
+        "sections": [{
+            "key": "experience",
+            "title": "Experience",
+            "entries": [{
+                "content_item_id": 1,
+                "title": "Engineer",
+                "organization": "Acme",
+                "location": "New York",
+                "dates": "2024 -- 2025",
+                "summary": "Platform engineering",
+                "skills": "Python",
+                "display_title": "Engineer",
+                "bullets": [{"id": 7, "text": "Built API"}],
+            }],
+        }],
+        "content_items": [{"id": 1, "title": "Engineer"}],
+        "bullets": [{"id": 7, "content_item_id": 1, "text": "Built API"}],
+        "entries": [{"content_item_id": 1, "bullet_ids": [7]}],
+    }
+    after = deepcopy(before)
+    after["sections"][0]["entries"][0].update({
+        "organization": "Acme Labs",
+        "dates": "2025 -- Present",
+        "summary": "Platform and reliability engineering",
+    })
+
+    diff = compare_snapshots(before, after)
+
+    rendered = [item for item in diff["modified"] if item["entity"] == "rendered_entry"]
+    assert len(rendered) == 1
+    assert rendered[0]["before"]["organization"] == "Acme"
+    assert rendered[0]["after"]["dates"] == "2025 -- Present"
+    assert rendered[0]["after"]["summary"] == "Platform and reliability engineering"
+    assert not [item for item in diff["modified"] if item["entity"] == "bullet"]
+    assert diff["summary"] == {"added": 0, "removed": 0, "changed": 1, "total": 1}
+
+
 def test_application_revision_comparison_is_owned_and_ephemeral():
     application = _application()
     first = _revision(
