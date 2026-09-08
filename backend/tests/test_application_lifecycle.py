@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+from pypdf import PdfWriter
 
 from backend.app import main
 
@@ -30,7 +31,10 @@ def _generated_revision(application_id, *, application=None):
     pdf_path = Path(f"generated/applications/{application_id}/revision-001/resume.pdf")
     (main.ROOT / latex_path).parent.mkdir(parents=True, exist_ok=True)
     (main.ROOT / latex_path).write_text("% generated")
-    (main.ROOT / pdf_path).write_bytes(b"%PDF-1.4 generated")
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with (main.ROOT / pdf_path).open("wb") as pdf_file:
+        writer.write(pdf_file)
     with main.SessionLocal() as session:
         revision = main.Revision(
             application_id=application_id,
@@ -65,6 +69,7 @@ def test_application_metadata_and_initial_status_history():
     assert history.status_code == 200
     assert [(row["from_status"], row["to_status"]) for row in history.json()] == [(None, "draft")]
 
+    assert client.post(f"/applications/{application['id']}/status", json={"status": "applied"}).status_code == 200
     updated = client.post(f"/applications/{application['id']}/status", json={
         "status": "interviewing", "reason": "Recruiter screen scheduled"
     })
@@ -83,6 +88,9 @@ def test_applied_status_sets_applied_at_and_rejects_backward_transition():
     changed = client.patch(f"/applications/{draft['id']}", json={"status": "applied"})
     assert changed.status_code == 200
     assert changed.json()["applied_at"]
+    skipped = _application()
+    assert client.post(f"/applications/{skipped['id']}/status", json={"status": "offer"}).status_code == 409
+    assert client.patch(f"/applications/{skipped['id']}", json={"applied_at": "manually-set"}).status_code == 422
 
 
 def test_submission_tracks_generated_revision_and_status_transactionally():
@@ -146,9 +154,14 @@ def test_legacy_migration_clears_invalid_submission_and_installs_ownership_guard
         connection.exec_driver_sql("CREATE TABLE revisions (id INTEGER PRIMARY KEY, application_id INTEGER, revision_number INTEGER, resume_json JSON, status VARCHAR(20))")
         connection.exec_driver_sql("CREATE TABLE base_entries (id INTEGER PRIMARY KEY, base_resume_id INTEGER, content_item_id INTEGER)")
         connection.exec_driver_sql("INSERT INTO applications (id, company, position, job_description, status) VALUES (1, 'Legacy', 'Engineer', 'x', 'draft')")
+        connection.exec_driver_sql("INSERT INTO applications (id, company, position, job_description, status) VALUES (2, 'Other', 'Engineer', 'x', 'draft')")
+        connection.exec_driver_sql("INSERT INTO revisions (id, application_id, revision_number, resume_json, status) VALUES (10, 1, 1, '{}', 'draft')")
     monkeypatch.setattr(main, "engine", legacy)
     main._apply_sqlite_integrity_migrations()
     with legacy.begin() as connection:
         assert connection.execute(text("SELECT submitted_revision_id FROM applications WHERE id=1")).scalar() is None
         with pytest.raises(IntegrityError):
             connection.execute(text("UPDATE applications SET submitted_revision_id=999 WHERE id=1"))
+        connection.execute(text("UPDATE applications SET submitted_revision_id=10 WHERE id=1"))
+        with pytest.raises(IntegrityError):
+            connection.execute(text("UPDATE revisions SET application_id=2 WHERE id=10"))

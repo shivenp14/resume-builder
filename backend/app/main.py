@@ -179,6 +179,17 @@ def _apply_sqlite_integrity_migrations() -> None:
                 SELECT RAISE(ABORT, 'cannot delete submitted revision');
             END
         """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS revisions_submitted_revision_owner_guard
+            BEFORE UPDATE OF application_id ON revisions
+            WHEN NEW.application_id != OLD.application_id AND EXISTS (
+                SELECT 1 FROM applications AS a
+                WHERE a.submitted_revision_id = OLD.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'cannot reassign submitted revision');
+            END
+        """))
 
 _apply_sqlite_integrity_migrations()
 def db():
@@ -396,6 +407,8 @@ def _transition_application(application:Application, to_status:str, s:Session, *
     """
     if to_status not in APPLICATION_STATUSES:
         raise HTTPException(422,"invalid application status")
+    if to_status in {"interviewing","offer"} and (application.status == "draft" or not application.applied_at):
+        raise HTTPException(409,"application must be applied with applied_at before interviewing or offer status")
     if not initial and to_status not in APPLICATION_STATUS_TRANSITIONS.get(application.status,set()):
         raise HTTPException(409,f"cannot transition application from {application.status} to {to_status}")
     if to_status == "applied" and not application.applied_at:
@@ -417,17 +430,28 @@ def _submittable_revision(application_id:int, revision_id:int, s:Session) -> Rev
     # A manually-created draft is intentionally not submit-ready.  Artifact
     # paths and a page count are the durable proof that PDF generation
     # completed successfully; failed/generating rows can never be submitted.
-    if revision.status not in {"draft","generated"} or not revision.latex_path or not revision.pdf_path or revision.page_count is None:
+    if revision.status not in {"draft","generated"} or revision.generated_at is None or not revision.latex_path or not revision.pdf_path or revision.page_count is None:
         raise HTTPException(409,"revision must be successfully generated before submission")
     artifact_paths=[Path(revision.latex_path),Path(revision.pdf_path)]
     artifact_paths=[path if path.is_absolute() else ROOT / path for path in artifact_paths]
     if any(not path.is_file() for path in artifact_paths):
         raise HTTPException(409,"revision artifacts are missing; generate the revision again before submission")
+    try:
+        actual_pages=count_pdf_pages(artifact_paths[1])
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(409,f"revision PDF could not be validated: {exc}")
+    if actual_pages != revision.page_count:
+        raise HTTPException(409,"revision PDF page count does not match generated revision metadata")
     return revision
 
 def _submit_revision(application:Application, revision:Revision, s:Session, *, submitted_at:datetime|None=None) -> Application:
     if application.status in TERMINAL_APPLICATION_STATUSES:
         raise HTTPException(409,f"cannot submit a revision for {application.status} application")
+    # Validate the current lifecycle state as well as the submission side
+    # effect.  This rejects legacy rows that reached an advanced status
+    # without the required applied timestamp.
+    if application.status != "draft":
+        _transition_application(application,application.status,s)
     application.submitted_revision_id=revision.id
     application.submitted_at=submitted_at or now()
     if not application.applied_at:
@@ -442,6 +466,8 @@ def add_app(x:AppIn,s:Session=Depends(db)):
     if x.status not in APPLICATION_STATUSES: raise HTTPException(422,"invalid application status")
     values=x.model_dump()
     requested_status=values.pop("status")
+    # applied_at is lifecycle-managed; callers may not seed or override it.
+    values.pop("applied_at",None)
     o=Application(**values,status="draft"); s.add(o); s.flush()
     _transition_application(o,requested_status,s,reason="application created",initial=True)
     s.commit(); s.refresh(o); return o
@@ -476,6 +502,8 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
         raise HTTPException(422,"invalid application status")
     if "base_resume_id" in changes and not s.get(BaseResume,changes["base_resume_id"]):
         raise HTTPException(404,"base resume not found")
+    if "applied_at" in changes:
+        raise HTTPException(422,"applied_at is lifecycle-managed and cannot be changed")
     if has_submitted_revision and submitted_revision_id is None:
         raise HTTPException(422,"submitted_revision_id cannot be cleared; submit a replacement revision instead")
     if submitted_revision_id is not None:
