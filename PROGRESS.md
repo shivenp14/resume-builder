@@ -38,7 +38,7 @@ Updated: September 7, 2026
 - [ ] Add personal-information records
 - [ ] Add content and bullet version history
 - [x] Add claim provenance and supporting evidence
-- [ ] Add archive restore and duplication
+- [x] Add archive restore and duplication
 - [ ] Add normalized skill relationships and aliases
 - [ ] Expand application metadata and status history
 - [ ] Add submitted-revision tracking
