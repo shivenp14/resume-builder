@@ -11,7 +11,7 @@ import uuid
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, event, func, or_, text
+from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, event, func, or_, text, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from .services.renderer import ResumeRenderer, count_pdf_pages
@@ -53,7 +53,14 @@ class BaseEntry(Base):
     id: Mapped[int]=mapped_column(primary_key=True); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); content_item_id: Mapped[int]=mapped_column(ForeignKey("content_items.id")); selected_bullet_ids: Mapped[list]=mapped_column(JSON,default=list); entry_order: Mapped[int]=mapped_column(Integer,default=0)
 class Application(Base):
     __tablename__="applications"
-    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
+    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); source: Mapped[str|None]=mapped_column(String(120)); location: Mapped[str|None]=mapped_column(String(200)); employment_type: Mapped[str|None]=mapped_column(String(80)); salary_range: Mapped[str|None]=mapped_column(String(120)); contact_name: Mapped[str|None]=mapped_column(String(200)); contact_email: Mapped[str|None]=mapped_column(String(320)); application_deadline: Mapped[str|None]=mapped_column(String(40)); applied_at: Mapped[str|None]=mapped_column(String(40)); follow_up_at: Mapped[str|None]=mapped_column(String(40)); submitted_revision_id: Mapped[int|None]=mapped_column(ForeignKey("revisions.id"),nullable=True); submitted_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
+class ApplicationStatusHistory(Base):
+    __tablename__="application_status_history"
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); from_status: Mapped[str|None]=mapped_column(String(30),nullable=True); to_status: Mapped[str]=mapped_column(String(30)); reason: Mapped[str|None]=mapped_column(Text,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    @property
+    def status(self): return self.to_status
+    @property
+    def changed_at(self): return self.created_at
 class JobAnalysis(Base):
     __tablename__="job_analyses"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirements: Mapped[list]=mapped_column(JSON); keywords: Mapped[list]=mapped_column(JSON); technologies: Mapped[list]=mapped_column(JSON); responsibilities: Mapped[list]=mapped_column(JSON); preferred_qualifications: Mapped[list]=mapped_column(JSON); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
@@ -63,7 +70,7 @@ class Proposal(Base):
 class Revision(Base):
     __tablename__="revisions"
     __table_args__=(UniqueConstraint("application_id", "revision_number", name="uq_revision_application_number"),)
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); revision_number: Mapped[int]; resume_json: Mapped[dict]=mapped_column(JSON); latex_path: Mapped[str|None]=mapped_column(String(500)); pdf_path: Mapped[str|None]=mapped_column(String(500)); page_count: Mapped[int|None]; status: Mapped[str]=mapped_column(String(20),default="draft"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); revision_number: Mapped[int]; resume_json: Mapped[dict]=mapped_column(JSON); latex_path: Mapped[str|None]=mapped_column(String(500)); pdf_path: Mapped[str|None]=mapped_column(String(500)); page_count: Mapped[int|None]; status: Mapped[str]=mapped_column(String(20),default="draft"); generated_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 class MissingConfirmation(Base):
     __tablename__="missing_confirmations"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirement: Mapped[str]=mapped_column(Text); status: Mapped[str]=mapped_column(String(20),default="unresolved"); context: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
@@ -157,21 +164,121 @@ def _append_bullet_version(s: Session, bullet: Bullet, *, action: str, changed_f
     return version
 
 def _apply_sqlite_integrity_migrations() -> None:
-    """Apply additive indexes and source-history backfills.
+    """Apply additive SQLite schema changes, indexes, and source-history backfills.
 
     SQLAlchemy's ``create_all`` never alters an existing SQLite table.  These
-    indexes and history tables make the integrity and audit guarantees
-    effective for both new and already-initialized local databases without
-    destructive table rebuilds.
+    migrations therefore add lifecycle columns one at a time and create the
+    status-history table/indexes without rebuilding or replacing user data.
+    Every operation is idempotent so startup can safely run repeatedly.
     """
     # ``create_all`` is intentionally additive.  This also makes the migration
     # safe to call against a database created by an older application version.
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        # A database made by an earlier version has the original tables but
+        # not these nullable lifecycle fields.  SQLite supports ADD COLUMN,
+        # which preserves all existing rows and is safe to repeat when guarded
+        # by an inspector check.
+        columns = {
+            "source": "VARCHAR(120)",
+            "location": "VARCHAR(200)",
+            "employment_type": "VARCHAR(80)",
+            "salary_range": "VARCHAR(120)",
+            "contact_name": "VARCHAR(200)",
+            "contact_email": "VARCHAR(320)",
+            "application_deadline": "VARCHAR(40)",
+            "applied_at": "VARCHAR(40)",
+            "follow_up_at": "VARCHAR(40)",
+            "submitted_revision_id": "INTEGER",
+            "submitted_at": "DATETIME",
+        }
+        existing = {column["name"] for column in inspect(connection).get_columns("applications")}
+        for name, declaration in columns.items():
+            if name not in existing:
+                connection.execute(text(f"ALTER TABLE applications ADD COLUMN {name} {declaration}"))
+        revision_columns = {column["name"] for column in inspect(connection).get_columns("revisions")}
+        if "generated_at" not in revision_columns:
+            connection.execute(text("ALTER TABLE revisions ADD COLUMN generated_at DATETIME"))
+        # A legacy SQLite table cannot gain a foreign key via ADD COLUMN.  A
+        # table rebuild would risk user data, so install equivalent ownership
+        # guards instead.  Invalid legacy pointers are cleared before the
+        # guards are installed; the application remains intact and can be
+        # resubmitted explicitly through the validated API.
+        connection.execute(text("""
+            UPDATE applications
+            SET submitted_revision_id = NULL
+            WHERE submitted_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM revisions AS r
+                  WHERE r.id = applications.submitted_revision_id
+                    AND r.application_id = applications.id
+              )
+        """))
+        # ``create_all`` runs before this function for the normal startup
+        # path.  This call also handles a pre-migration database that did not
+        # yet have the new history table.
+        ApplicationStatusHistory.__table__.create(connection, checkfirst=True)
+        # Preserve a useful starting point for applications created before
+        # status history existed.  The NOT EXISTS guard makes this backfill
+        # idempotent and never duplicates an existing event.
+        connection.execute(text("""
+            INSERT INTO application_status_history (application_id, from_status, to_status, reason, created_at)
+            SELECT a.id, NULL, a.status, 'application migrated', CURRENT_TIMESTAMP
+            FROM applications AS a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM application_status_history AS h
+                WHERE h.application_id = a.id
+            )
+        """))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_application_number_idx ON revisions (application_id, revision_number)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_base_entry_resume_item_idx ON base_entries (base_resume_id, content_item_id)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_content_item_version_number_idx ON content_item_versions (content_item_id, version_number)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_bullet_version_number_idx ON bullet_versions (bullet_id, version_number)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_application_status_history_application_id ON application_status_history (application_id, created_at)"))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_insert_guard
+            BEFORE INSERT ON applications
+            WHEN NEW.submitted_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM revisions AS r
+                WHERE r.id = NEW.submitted_revision_id AND r.application_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'submitted revision must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_update_guard
+            BEFORE UPDATE OF submitted_revision_id ON applications
+            WHEN NEW.submitted_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM revisions AS r
+                WHERE r.id = NEW.submitted_revision_id AND r.application_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'submitted revision must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS revisions_submitted_revision_delete_guard
+            BEFORE DELETE ON revisions
+            WHEN EXISTS (
+                SELECT 1 FROM applications AS a
+                WHERE a.submitted_revision_id = OLD.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'cannot delete submitted revision');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS revisions_submitted_revision_owner_guard
+            BEFORE UPDATE OF application_id ON revisions
+            WHEN NEW.application_id != OLD.application_id AND EXISTS (
+                SELECT 1 FROM applications AS a
+                WHERE a.submitted_revision_id = OLD.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'cannot reassign submitted revision');
+            END
+        """))
 
     # Older databases have source rows but no history.  Seed one immutable
     # baseline snapshot per row; the existence check makes this backfill
@@ -199,8 +306,51 @@ class BulletIn(BaseModel): text:str; tags:list[str]=Field(default_factory=list);
 class SkillIn(BaseModel): name:str; category:str|None=None; aliases:list[str]=Field(default_factory=list); notes:str|None=None; verified:bool=False
 class ResumeIn(BaseModel): name:str; template_id:str="default"; section_order:list[str]=Field(default_factory=list); layout_settings:dict=Field(default_factory=dict)
 class EntryIn(BaseModel): content_item_id:int; selected_bullet_ids:list[int]=Field(default_factory=list); entry_order:int=0
-class AppIn(BaseModel): company:str; position:str; job_description:str; base_resume_id:int; job_url:str|None=None; notes:str|None=None
-class AppPatch(BaseModel): company:str|None=None; position:str|None=None; job_description:str|None=None; base_resume_id:int|None=None; job_url:str|None=None; notes:str|None=None; status:str|None=None
+class AppIn(BaseModel):
+    company:str
+    position:str
+    job_description:str
+    base_resume_id:int
+    status:str="draft"
+    job_url:str|None=None
+    notes:str|None=None
+    source:str|None=None
+    location:str|None=None
+    employment_type:str|None=None
+    salary_range:str|None=None
+    contact_name:str|None=None
+    contact_email:str|None=None
+    application_deadline:str|None=None
+    applied_at:str|None=None
+    follow_up_at:str|None=None
+
+class AppPatch(BaseModel):
+    company:str|None=None
+    position:str|None=None
+    job_description:str|None=None
+    base_resume_id:int|None=None
+    job_url:str|None=None
+    notes:str|None=None
+    status:str|None=None
+    status_reason:str|None=None
+    source:str|None=None
+    location:str|None=None
+    employment_type:str|None=None
+    salary_range:str|None=None
+    contact_name:str|None=None
+    contact_email:str|None=None
+    application_deadline:str|None=None
+    applied_at:str|None=None
+    follow_up_at:str|None=None
+    submitted_revision_id:int|None=None
+
+class StatusChangeIn(BaseModel):
+    status:str
+    reason:str|None=None
+
+class SubmitRevisionIn(BaseModel):
+    revision_id:int
+    submitted_at:datetime|None=None
 class ProposalIn(BaseModel): payload:dict[str,Any]
 class RevisionIn(BaseModel): resume_json:dict[str,Any]
 class ConfirmationIn(BaseModel): status:str; context:dict[str,Any]=Field(default_factory=dict)
@@ -228,12 +378,14 @@ class SkillOut(APIOut): id:int; name:str; category:str|None; aliases:list[str]; 
 class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
 class ApplicationOut(APIOut):
-    id:int; company:str; position:str; job_url:str|None; job_description:str; notes:str|None; status:str; base_resume_id:int; created_at:datetime; updated_at:datetime
+    id:int; company:str; position:str; job_url:str|None; job_description:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
+class StatusHistoryOut(APIOut):
+    id:int; application_id:int; from_status:str|None; to_status:str; status:str; reason:str|None; created_at:datetime; changed_at:datetime
 class JobAnalysisOut(APIOut):
     id:int; application_id:int; requirements:list[str]; keywords:list[str]; technologies:list[str]; responsibilities:list[str]; preferred_qualifications:list[str]; created_at:datetime
 class ProposalOut(APIOut): id:int; application_id:int; payload:dict[str,Any]; status:str; created_at:datetime
 class RevisionOut(APIOut):
-    id:int; application_id:int; revision_number:int; resume_json:dict[str,Any]; latex_path:str|None; pdf_path:str|None; page_count:int|None; status:str; created_at:datetime
+    id:int; application_id:int; revision_number:int; resume_json:dict[str,Any]; latex_path:str|None; pdf_path:str|None; page_count:int|None; status:str; generated_at:datetime|None; created_at:datetime
 class ConfirmationOut(APIOut): id:int; application_id:int; requirement:str; status:str; context:dict[str,Any]; created_at:datetime
 class OptimizationRunOut(APIOut):
     id:int; application_id:int; operation:str; status:str; model:str; reasoning_effort:str; prompt_version:str; schema_version:str; idempotency_key:str|None; input_payload:dict[str,Any]; output_payload:dict[str,Any]|None; error:str|None; created_at:datetime; completed_at:datetime|None
@@ -482,10 +634,89 @@ def delete_entry(id:int,s:Session=Depends(db)):
     o=s.get(BaseEntry,id)
     if not o: raise HTTPException(404,"base entry not found")
     s.delete(o); s.commit(); return {"deleted":True}
+APPLICATION_STATUSES={"draft","applied","interviewing","offer","rejected","withdrawn"}
+APPLICATION_STATUS_TRANSITIONS={
+    "draft":{"draft","applied","interviewing","offer","rejected","withdrawn"},
+    "applied":{"applied","interviewing","offer","rejected","withdrawn"},
+    "interviewing":{"interviewing","offer","rejected","withdrawn"},
+    "offer":{"offer","rejected","withdrawn"},
+    "rejected":{"rejected"},
+    "withdrawn":{"withdrawn"},
+}
+TERMINAL_APPLICATION_STATUSES={"rejected","withdrawn"}
+
+def _transition_application(application:Application, to_status:str, s:Session, *, reason:str|None=None, initial:bool=False) -> ApplicationStatusHistory|None:
+    """Validate and apply a lifecycle transition plus its side effects.
+
+    The caller owns the surrounding transaction, so an application update and
+    its history event commit (or roll back) together.
+    """
+    if to_status not in APPLICATION_STATUSES:
+        raise HTTPException(422,"invalid application status")
+    if to_status in {"interviewing","offer"} and (application.status == "draft" or not application.applied_at):
+        raise HTTPException(409,"application must be applied with applied_at before interviewing or offer status")
+    if not initial and to_status not in APPLICATION_STATUS_TRANSITIONS.get(application.status,set()):
+        raise HTTPException(409,f"cannot transition application from {application.status} to {to_status}")
+    if to_status == "applied" and not application.applied_at:
+        application.applied_at=now().isoformat()
+    if not initial and application.status == to_status:
+        return None
+    event_record=ApplicationStatusHistory(application_id=application.id,
+        from_status=None if initial else application.status,to_status=to_status,reason=reason)
+    application.status=to_status
+    s.add(event_record)
+    return event_record
+
+def _submittable_revision(application_id:int, revision_id:int, s:Session) -> Revision:
+    revision=s.get(Revision,revision_id)
+    if not revision:
+        raise HTTPException(404,"revision not found")
+    if revision.application_id != application_id:
+        raise HTTPException(422,"revision does not belong to application")
+    # A manually-created draft is intentionally not submit-ready.  Artifact
+    # paths and a page count are the durable proof that PDF generation
+    # completed successfully; failed/generating rows can never be submitted.
+    if revision.status not in {"draft","generated"} or revision.generated_at is None or not revision.latex_path or not revision.pdf_path or revision.page_count is None:
+        raise HTTPException(409,"revision must be successfully generated before submission")
+    artifact_paths=[Path(revision.latex_path),Path(revision.pdf_path)]
+    artifact_paths=[path if path.is_absolute() else ROOT / path for path in artifact_paths]
+    if any(not path.is_file() for path in artifact_paths):
+        raise HTTPException(409,"revision artifacts are missing; generate the revision again before submission")
+    try:
+        actual_pages=count_pdf_pages(artifact_paths[1])
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(409,f"revision PDF could not be validated: {exc}")
+    if actual_pages != revision.page_count:
+        raise HTTPException(409,"revision PDF page count does not match generated revision metadata")
+    return revision
+
+def _submit_revision(application:Application, revision:Revision, s:Session, *, submitted_at:datetime|None=None) -> Application:
+    if application.status in TERMINAL_APPLICATION_STATUSES:
+        raise HTTPException(409,f"cannot submit a revision for {application.status} application")
+    # Validate the current lifecycle state as well as the submission side
+    # effect.  This rejects legacy rows that reached an advanced status
+    # without the required applied timestamp.
+    if application.status != "draft":
+        _transition_application(application,application.status,s)
+    application.submitted_revision_id=revision.id
+    application.submitted_at=submitted_at or now()
+    if not application.applied_at:
+        application.applied_at=application.submitted_at.isoformat()
+    if application.status == "draft":
+        _transition_application(application,"applied",s,reason="revision submitted")
+    return application
+
 @app.post("/applications",response_model=ApplicationOut)
 def add_app(x:AppIn,s:Session=Depends(db)):
     if not s.get(BaseResume,x.base_resume_id): raise HTTPException(404,"base resume not found")
-    o=Application(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
+    if x.status not in APPLICATION_STATUSES: raise HTTPException(422,"invalid application status")
+    values=x.model_dump()
+    requested_status=values.pop("status")
+    # applied_at is lifecycle-managed; callers may not seed or override it.
+    values.pop("applied_at",None)
+    o=Application(**values,status="draft"); s.add(o); s.flush()
+    _transition_application(o,requested_status,s,reason="application created",initial=True)
+    s.commit(); s.refresh(o); return o
 @app.get("/applications",response_model=list[ApplicationOut])
 def applications(status:str|None=None, q:str|None=None, limit:int=50, offset:int=0, s:Session=Depends(db)):
     if not 1 <= limit <= 100 or offset < 0: raise HTTPException(422,"limit must be 1-100 and offset must be non-negative")
@@ -505,17 +736,46 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
     o=s.get(Application,id)
     if not o: raise HTTPException(404,"application not found")
     changes=x.model_dump(exclude_unset=True)
+    status_reason=changes.pop("status_reason",None)
+    has_submitted_revision="submitted_revision_id" in changes
+    submitted_revision_id=changes.pop("submitted_revision_id",None)
     required={"company","position","job_description"}
     if any(key in changes and not isinstance(changes[key],str) for key in required):
         raise HTTPException(422,"company, position, and job_description cannot be null")
     if any(key in changes and not changes[key].strip() for key in required):
         raise HTTPException(422,"company, position, and job_description cannot be blank")
-    if "status" in changes and changes["status"] not in {"draft","applied","interviewing","offer","rejected","withdrawn"}:
+    if "status" in changes and changes["status"] not in APPLICATION_STATUSES:
         raise HTTPException(422,"invalid application status")
     if "base_resume_id" in changes and not s.get(BaseResume,changes["base_resume_id"]):
         raise HTTPException(404,"base resume not found")
-    for key,value in changes.items(): setattr(o,key,value)
+    if "applied_at" in changes:
+        raise HTTPException(422,"applied_at is lifecycle-managed and cannot be changed")
+    if has_submitted_revision and submitted_revision_id is None:
+        raise HTTPException(422,"submitted_revision_id cannot be cleared; submit a replacement revision instead")
+    if submitted_revision_id is not None:
+        revision_to_submit=_submittable_revision(id,submitted_revision_id,s)
+        _submit_revision(o,revision_to_submit,s)
+    for key,value in changes.items():
+        if key != "status": setattr(o,key,value)
+    if "status" in changes:
+        _transition_application(o,changes["status"],s,reason=status_reason)
     s.commit(); s.refresh(o); return o
+
+@app.post("/applications/{id}/status",response_model=ApplicationOut)
+def change_application_status(id:int,x:StatusChangeIn,s:Session=Depends(db)):
+    o=s.get(Application,id)
+    if not o: raise HTTPException(404,"application not found")
+    _transition_application(o,x.status,s,reason=x.reason)
+    s.commit(); s.refresh(o); return o
+
+@app.get("/applications/{id}/status-history",response_model=list[StatusHistoryOut])
+def application_status_history(id:int,s:Session=Depends(db)):
+    if not s.get(Application,id): raise HTTPException(404,"application not found")
+    return s.query(ApplicationStatusHistory).filter_by(application_id=id).order_by(ApplicationStatusHistory.created_at,ApplicationStatusHistory.id).all()
+
+@app.get("/applications/{id}/history",response_model=list[StatusHistoryOut])
+def application_history_alias(id:int,s:Session=Depends(db)):
+    return application_status_history(id,s)
 
 def _validate_entry_bullets(content_item_id:int, bullet_ids:list[int], s:Session) -> None:
     if len(bullet_ids) != len(set(bullet_ids)):
@@ -927,13 +1187,41 @@ def generate(id:int,x:GenerateIn,s:Session=Depends(db)):
     except (FileNotFoundError, RuntimeError) as exc:
         o.status="failed"; s.commit()
         raise HTTPException(503,f"PDF was generated but could not be validated: {exc}")
-    o.latex_path=str(tex.relative_to(ROOT)); o.pdf_path=str(pdf.relative_to(ROOT)); o.page_count=page_count; o.status='draft'; s.commit(); s.refresh(o)
+    o.latex_path=str(tex.relative_to(ROOT)); o.pdf_path=str(pdf.relative_to(ROOT)); o.page_count=page_count; o.generated_at=now(); o.status='draft'; s.commit(); s.refresh(o)
     # Keep filesystem paths for local tooling and expose browser-served URLs
     # for the Vite UI. StaticFiles mounts the generated directory at /generated.
     return {**{c.name:getattr(o,c.name) for c in Revision.__table__.columns},
             'proposal_id':proposal.id,
             'latex_url':'/generated/'+str(tex.relative_to(GENERATED)),
             'pdf_url':'/generated/'+str(pdf.relative_to(GENERATED))}
+
+@app.post("/applications/{id}/submit",response_model=ApplicationOut)
+def submit_application(id:int,x:SubmitRevisionIn,s:Session=Depends(db)):
+    """Record the exact generated revision used for an application submission."""
+    o=s.get(Application,id)
+    if not o: raise HTTPException(404,"application not found")
+    revision_to_submit=_submittable_revision(id,x.revision_id,s)
+    _submit_revision(o,revision_to_submit,s,submitted_at=x.submitted_at)
+    s.commit(); s.refresh(o); return o
+
+@app.post("/applications/{id}/submissions",response_model=ApplicationOut)
+def submit_application_alias(id:int,x:SubmitRevisionIn,s:Session=Depends(db)):
+    return submit_application(id,x,s)
+
+@app.post("/applications/{id}/submitted-revision",response_model=ApplicationOut)
+def submit_revision_alias(id:int,x:SubmitRevisionIn,s:Session=Depends(db)):
+    return submit_application(id,x,s)
+
+@app.get("/applications/{id}/submitted-revision",response_model=RevisionOut)
+def submitted_revision(id:int,s:Session=Depends(db)):
+    o=s.get(Application,id)
+    if not o: raise HTTPException(404,"application not found")
+    if o.submitted_revision_id is None: raise HTTPException(404,"application has no submitted revision")
+    revision=s.get(Revision,o.submitted_revision_id)
+    # A dangling association can only be produced by a legacy external write;
+    # do not expose it as a valid submission.
+    if not revision or revision.application_id != id: raise HTTPException(404,"submitted revision not found")
+    return revision
 
 class RenderIn(BaseModel): snapshot:dict
 @app.post("/render",response_model=RenderOut)
