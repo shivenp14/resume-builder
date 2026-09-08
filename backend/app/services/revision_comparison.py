@@ -146,6 +146,26 @@ def _collection_changes(
     return added, removed, changed
 
 
+def _suppress_derived_display_title(
+    changes: list[dict[str, Any]],
+    changed_item_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Avoid reporting ``display_title`` twice when the source title changed."""
+
+    filtered: list[dict[str, Any]] = []
+    for change in changes:
+        if change["id"] not in changed_item_ids:
+            filtered.append(change)
+            continue
+        before = deepcopy(change["before"] or {})
+        after = deepcopy(change["after"] or {})
+        before.pop("display_title", None)
+        after.pop("display_title", None)
+        if _normalized(before) != _normalized(after):
+            filtered.append({**change, "before": before, "after": after})
+    return filtered
+
+
 def compare_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     """Return a deterministic semantic diff between two resume snapshots.
 
@@ -213,7 +233,8 @@ def compare_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str
     )
     added.extend(rendered_entry_changes[0])
     removed.extend(rendered_entry_changes[1])
-    changed.extend(rendered_entry_changes[2])
+    changed_item_ids = {change["id"] for change in item_changes[2]}
+    changed.extend(_suppress_derived_display_title(rendered_entry_changes[2], changed_item_ids))
 
     # Section order and headings affect the rendered document.  Compare the
     # stable layout fields only; section entries are represented by entries and

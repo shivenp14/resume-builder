@@ -101,6 +101,32 @@ def test_semantic_diff_captures_rendered_entry_metadata_without_bullet_noise():
     assert diff["summary"] == {"added": 0, "removed": 0, "changed": 1, "total": 1}
 
 
+def test_title_rename_does_not_duplicate_derived_display_title_change():
+    before = {
+        "contact": {},
+        "sections": [{
+            "key": "experience",
+            "title": "Experience",
+            "entries": [{
+                "content_item_id": 1,
+                "organization": "Acme",
+                "display_title": "Engineer",
+            }],
+        }],
+        "content_items": [{"id": 1, "title": "Engineer"}],
+        "bullets": [],
+        "entries": [{"content_item_id": 1, "bullet_ids": []}],
+    }
+    after = deepcopy(before)
+    after["content_items"][0]["title"] = "Senior Engineer"
+    after["sections"][0]["entries"][0]["display_title"] = "Senior Engineer"
+
+    diff = compare_snapshots(before, after)
+
+    assert [item["entity"] for item in diff["modified"]] == ["content_item"]
+    assert diff["summary"] == {"added": 0, "removed": 0, "changed": 1, "total": 1}
+
+
 def test_application_revision_comparison_is_owned_and_ephemeral():
     application = _application()
     first = _revision(
