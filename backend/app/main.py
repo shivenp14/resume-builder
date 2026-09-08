@@ -4,14 +4,14 @@ The API deliberately keeps AI output as proposals: source records and revisions
 are never silently changed by analysis or optimization.
 """
 from datetime import datetime, timezone
-import hashlib, json, re
+import copy, hashlib, json, re
 from pathlib import Path
 from typing import Any, Literal
 import uuid
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, event, func, text
+from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, event, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from .services.renderer import ResumeRenderer, count_pdf_pages
@@ -92,6 +92,7 @@ def db():
 
 class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list)
 class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None
+class DuplicateItemIn(BaseModel): title:str|None=None
 class BulletIn(BaseModel): text:str; tags:list[str]=Field(default_factory=list); supporting_facts:list[str]=Field(default_factory=list); is_locked:bool=False; is_preferred:bool=False
 class SkillIn(BaseModel): name:str; category:str|None=None; aliases:list[str]=Field(default_factory=list); notes:str|None=None; verified:bool=False
 class ResumeIn(BaseModel): name:str; template_id:str="default"; section_order:list[str]=Field(default_factory=list); layout_settings:dict=Field(default_factory=dict)
@@ -120,6 +121,7 @@ class ContentItemOut(APIOut):
     id:int; type:str; title:str; organization:str|None; location:str|None; start_date:str|None; end_date:str|None; summary:str|None; tags:list[str]; is_archived:bool; created_at:datetime; updated_at:datetime
 class BulletOut(APIOut):
     id:int; content_item_id:int; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool
+class ContentItemWithBulletsOut(ContentItemOut): bullets:list[BulletOut] = Field(default_factory=list)
 class SkillOut(APIOut): id:int; name:str; category:str|None; aliases:list[str]; notes:str|None; verified:bool
 class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
@@ -151,7 +153,26 @@ def health(): return {"status":"ok"}
 def create_item(x:ItemIn,s:Session=Depends(db)):
     o=ContentItem(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/content-items",response_model=list[ContentItemOut])
-def items(s:Session=Depends(db)): return s.query(ContentItem).filter_by(is_archived=False).all()
+def items(include_archived:bool=False, archived:bool|None=None, s:Session=Depends(db)):
+    """List the active library by default, with explicit archive filters.
+
+    ``include_archived`` provides an inventory view while ``archived=true``
+    narrows the result to the archive.  The default remains backwards
+    compatible: archived source records never appear in the active library.
+    """
+    query=s.query(ContentItem)
+    if archived is True:
+        query=query.filter_by(is_archived=True)
+    elif archived is False or not include_archived:
+        query=query.filter_by(is_archived=False)
+    return query.order_by(ContentItem.id).all()
+
+@app.get("/content-items/archived",response_model=list[ContentItemOut])
+@app.get("/content-items/archive",response_model=list[ContentItemOut])
+def archived_items(s:Session=Depends(db)):
+    """Return the reversible archive inventory without mixing it into active data."""
+    return s.query(ContentItem).filter_by(is_archived=True).order_by(ContentItem.id).all()
+
 @app.get("/content-items/{id}",response_model=ContentItemOut)
 def item(id:int,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
@@ -168,6 +189,57 @@ def archive_item(id:int,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
     if not o: raise HTTPException(404,"content item not found")
     o.is_archived=True; s.commit(); return {"archived":True}
+
+@app.post("/content-items/{id}/restore",response_model=ContentItemOut)
+def restore_item(id:int,s:Session=Depends(db)):
+    """Restore an archived item without changing its bullets or references."""
+    o=s.get(ContentItem,id)
+    if not o: raise HTTPException(404,"content item not found")
+    o.is_archived=False; s.commit(); s.refresh(o); return o
+
+@app.post("/content-items/{id}/duplicate",response_model=ContentItemWithBulletsOut)
+def duplicate_item(id:int,x:DuplicateItemIn|None=None,s:Session=Depends(db)):
+    """Copy a source item and all bullets as one transaction.
+
+    The duplicate is always active and receives new item/bullet IDs.  No base
+    resume entries are copied: references are intentionally explicit so a
+    duplicate cannot silently alter an existing resume.
+    """
+    source=s.get(ContentItem,id)
+    if not source: raise HTTPException(404,"content item not found")
+    title=(x.title if x and x.title is not None else f"{source.title} (Copy)")
+    if not title.strip(): raise HTTPException(422,"duplicate title cannot be blank")
+    try:
+        # A savepoint keeps the item and every bullet atomic even though the
+        # request session may already have an open transaction from the read.
+        with s.begin_nested():
+            duplicate=ContentItem(
+                type=source.type, title=title,
+                organization=source.organization, location=source.location,
+                start_date=source.start_date, end_date=source.end_date,
+                summary=source.summary, tags=copy.deepcopy(source.tags or []),
+                is_archived=False,
+            )
+            s.add(duplicate); s.flush()
+            copied_bullets=[]
+            for bullet in source.bullets:
+                copied=Bullet(
+                    content_item_id=duplicate.id, text=bullet.text,
+                    tags=copy.deepcopy(bullet.tags or []),
+                    supporting_facts=copy.deepcopy(bullet.supporting_facts or []),
+                    is_locked=bullet.is_locked, is_preferred=bullet.is_preferred,
+                )
+                s.add(copied); copied_bullets.append(copied)
+            s.flush()
+        s.commit(); s.refresh(duplicate)
+        for bullet in copied_bullets: s.refresh(bullet)
+        return {**duplicate.__dict__, "bullets": copied_bullets}
+    except HTTPException:
+        s.rollback(); raise
+    except Exception:
+        s.rollback()
+        raise HTTPException(500,"could not duplicate content item; no changes were saved")
+
 @app.post("/content-items/{id}/bullets",response_model=BulletOut)
 def add_bullet(id:int,x:BulletIn,s:Session=Depends(db)):
     if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
@@ -216,7 +288,11 @@ def edit_resume(id:int,x:ResumeIn,s:Session=Depends(db)):
     s.commit(); return o
 @app.post("/base-resumes/{id}/entries",response_model=BaseEntryOut)
 def add_entry(id:int,x:EntryIn,s:Session=Depends(db)):
-    if not s.get(BaseResume,id) or not s.get(ContentItem,x.content_item_id): raise HTTPException(404,"resume or content item not found")
+    if not s.get(BaseResume,id): raise HTTPException(404,"resume or content item not found")
+    content_item=s.get(ContentItem,x.content_item_id)
+    if not content_item: raise HTTPException(404,"resume or content item not found")
+    if content_item.is_archived:
+        raise HTTPException(409,"cannot add an archived content item; restore it first")
     _validate_entry_bullets(x.content_item_id,x.selected_bullet_ids,s)
     o=BaseEntry(base_resume_id=id,**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/base-resumes/{id}/entries",response_model=list[BaseEntryOut])
@@ -227,7 +303,12 @@ def entries(id:int,s:Session=Depends(db)):
 def edit_entry(id:int,x:EntryIn,s:Session=Depends(db)):
     o=s.get(BaseEntry,id)
     if not o: raise HTTPException(404,"base entry not found")
-    if not s.get(ContentItem,x.content_item_id): raise HTTPException(404,"content item not found")
+    content_item=s.get(ContentItem,x.content_item_id)
+    if not content_item: raise HTTPException(404,"content item not found")
+    # Existing references remain valid after archival, but an edit may not
+    # introduce a new reference to an inactive source record.
+    if content_item.is_archived and o.content_item_id != x.content_item_id:
+        raise HTTPException(409,"cannot reference an archived content item; restore it first")
     _validate_entry_bullets(x.content_item_id,x.selected_bullet_ids,s)
     for k,v in x.model_dump(exclude_unset=True).items(): setattr(o,k,v)
     s.commit(); s.refresh(o); return o
@@ -300,13 +381,23 @@ def _run_error(exc):
 def _verified_context(a:Application,s:Session) -> dict[str,Any]:
     base=s.get(BaseResume,a.base_resume_id)
     entries=s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id).order_by(BaseEntry.entry_order).all()
-    all_items=s.query(ContentItem).filter_by(is_archived=False).order_by(ContentItem.id).all()
+    # Archived records are excluded from the active library, but an existing
+    # base resume must continue to resolve its historical references.  This
+    # keeps archival reversible and prevents source disappearance from
+    # breaking proposal validation or snapshot rendering.
+    referenced_item_ids={entry.content_item_id for entry in entries}
+    item_query=s.query(ContentItem)
+    if referenced_item_ids:
+        item_query=item_query.filter(or_(ContentItem.is_archived.is_(False), ContentItem.id.in_(referenced_item_ids)))
+    else:
+        item_query=item_query.filter_by(is_archived=False)
+    all_items=item_query.order_by(ContentItem.id).all()
     item_ids=[item.id for item in all_items]
     all_bullets=s.query(Bullet).filter(Bullet.content_item_id.in_(item_ids)).order_by(Bullet.id).all() if item_ids else []
     verified={
         "content_items":[{"id":item.id,"type":item.type,"title":item.title,"organization":item.organization,
             "location":item.location,"start_date":item.start_date,"end_date":item.end_date,
-            "summary":item.summary,"tags":item.tags} for item in all_items],
+            "summary":item.summary,"tags":item.tags,"is_archived":item.is_archived} for item in all_items],
         "bullets":[{"id":bullet.id,"content_item_id":bullet.content_item_id,"text":bullet.text,
             "tags":bullet.tags,"supporting_facts":bullet.supporting_facts,"is_locked":bullet.is_locked,
             "is_preferred":bullet.is_preferred} for bullet in all_bullets],
@@ -326,12 +417,16 @@ def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fr
     grounding={**context["verified_library"],"entries":[]}
     validate_proposal(payload,grounding)
     owned:dict[int,set[int]]={item["id"]:set() for item in grounding["content_items"]}
+    base_item_ids={entry["content_item_id"] for entry in context["base_snapshot"]["entries"]}
     for bullet in grounding["bullets"]: owned[bullet["content_item_id"]].add(bullet["id"])
     selected_ids=[entry.get("content_item_id") for entry in payload.get("selected_entries",[])]
     if len(selected_ids)!=len(set(selected_ids)): raise ValidationError("proposal contains duplicate selected entries")
     for entry in payload.get("selected_entries",[]):
         item_id=entry.get("content_item_id")
         if item_id not in owned: raise ValidationError("proposal selects unknown content item")
+        source_item=next(item for item in grounding["content_items"] if item["id"]==item_id)
+        if source_item.get("is_archived") and item_id not in base_item_ids:
+            raise ValidationError("proposal selects an archived content item; restore it first")
         if any(bid not in owned[item_id] for bid in entry.get("bullet_ids",[])):
             raise ValidationError("selected bullet does not belong to content item")
     if selected_ids:
@@ -415,7 +510,13 @@ def _comparison(a:Application,s:Session):
     analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
     if not analysis: raise HTTPException(404,"analyze application first")
     terms=list(dict.fromkeys([*analysis.technologies,*analysis.keywords]))
-    all_items=s.query(ContentItem).filter_by(is_archived=False).all(); base_ids={e.content_item_id for e in s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id)}
+    base_ids={e.content_item_id for e in s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id)}
+    item_query=s.query(ContentItem)
+    if base_ids:
+        item_query=item_query.filter(or_(ContentItem.is_archived.is_(False), ContentItem.id.in_(base_ids)))
+    else:
+        item_query=item_query.filter_by(is_archived=False)
+    all_items=item_query.all()
     represented=[]; weak=[]; library_only=[]; unsupported=[]
     for term in terms:
         hits=[i for i in all_items if term.lower() in ((i.title or '')+' '+(i.summary or '')).lower() or any(term.lower() in b.text.lower() for b in i.bullets)]
