@@ -19,6 +19,7 @@ from .services.validation import ValidationError, validate_resume_snapshot, vali
 from .services.codex_provider import CodexProvider, CodexProviderError, MODEL, REASONING
 from .services.llm_prompts import PROMPT_VERSION
 from .services.llm_schemas import SCHEMA_VERSION
+from .services.revision_comparison import compare_snapshots
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
@@ -386,6 +387,16 @@ class JobAnalysisOut(APIOut):
 class ProposalOut(APIOut): id:int; application_id:int; payload:dict[str,Any]; status:str; created_at:datetime
 class RevisionOut(APIOut):
     id:int; application_id:int; revision_number:int; resume_json:dict[str,Any]; latex_path:str|None; pdf_path:str|None; page_count:int|None; status:str; generated_at:datetime|None; created_at:datetime
+class RevisionReferenceOut(APIOut):
+    id:int; revision_number:int
+class RevisionDiffChangeOut(APIOut):
+    kind:Literal["added","removed","changed"]; entity:str; id:str|None; path:str; before:Any=None; after:Any=None
+class RevisionDiffSummaryOut(APIOut):
+    added:int; removed:int; changed:int; total:int
+class RevisionComparisonOut(APIOut):
+    application_id:int; from_revision:RevisionReferenceOut; to_revision:RevisionReferenceOut
+    changed:bool; summary:RevisionDiffSummaryOut
+    added:list[RevisionDiffChangeOut]; removed:list[RevisionDiffChangeOut]; modified:list[RevisionDiffChangeOut]; changed_items:list[RevisionDiffChangeOut]; changes:list[RevisionDiffChangeOut]
 class ConfirmationOut(APIOut): id:int; application_id:int; requirement:str; status:str; context:dict[str,Any]; created_at:datetime
 class OptimizationRunOut(APIOut):
     id:int; application_id:int; operation:str; status:str; model:str; reasoning_effort:str; prompt_version:str; schema_version:str; idempotency_key:str|None; input_payload:dict[str,Any]; output_payload:dict[str,Any]|None; error:str|None; created_at:datetime; completed_at:datetime|None
@@ -1156,6 +1167,79 @@ def revision(id:int,x:RevisionIn,s:Session=Depends(db)):
 def revisions(id:int,s:Session=Depends(db)):
     if not s.get(Application,id): raise HTTPException(404,"application not found")
     return s.query(Revision).filter_by(application_id=id).order_by(Revision.revision_number).all()
+
+def _revision_comparison_response(
+    application_id: int,
+    from_revision_id: int,
+    to_revision_id: int,
+    s: Session,
+) -> dict[str, Any]:
+    """Compare two revisions owned by one application without persisting a diff."""
+
+    if not s.get(Application, application_id):
+        raise HTTPException(404, "application not found")
+    before = s.get(Revision, from_revision_id)
+    after = s.get(Revision, to_revision_id)
+    # Do not reveal whether a revision exists under another application.  A
+    # revision is addressable only through its owning application here.
+    if not before or before.application_id != application_id:
+        raise HTTPException(404, "from revision not found")
+    if not after or after.application_id != application_id:
+        raise HTTPException(404, "to revision not found")
+
+    diff = compare_snapshots(before.resume_json, after.resume_json)
+    return {
+        "application_id": application_id,
+        "from_revision": {"id": before.id, "revision_number": before.revision_number},
+        "to_revision": {"id": after.id, "revision_number": after.revision_number},
+        **diff,
+    }
+
+
+@app.get("/applications/{id}/revisions/compare", response_model=RevisionComparisonOut)
+def compare_revisions(
+    id: int,
+    from_revision_id: int | None = None,
+    to_revision_id: int | None = None,
+    before_revision_id: int | None = None,
+    after_revision_id: int | None = None,
+    s: Session = Depends(db),
+):
+    """Return an ephemeral semantic diff for two revisions of an application.
+
+    ``before_revision_id``/``after_revision_id`` are accepted as descriptive
+    aliases for clients that do not use the ``from``/``to`` terminology.  A
+    request must provide exactly one complete pair.
+    """
+
+    supplied = [
+        (from_revision_id, to_revision_id),
+        (before_revision_id, after_revision_id),
+    ]
+    pairs = [pair for pair in supplied if any(value is not None for value in pair)]
+    if len(pairs) != 1 or any(value is None for value in pairs[0]):
+        raise HTTPException(422, "provide from_revision_id and to_revision_id")
+    left, right = pairs[0]
+    return _revision_comparison_response(id, left, right, s)
+
+
+@app.get("/applications/{id}/revisions/{from_revision_id}/compare/{to_revision_id}", response_model=RevisionComparisonOut)
+def compare_revision_path(id: int, from_revision_id: int, to_revision_id: int, s: Session = Depends(db)):
+    """Path-parameter form of the revision comparison endpoint."""
+
+    return _revision_comparison_response(id, from_revision_id, to_revision_id, s)
+
+
+@app.get("/revisions/{from_revision_id}/compare/{to_revision_id}", response_model=RevisionComparisonOut)
+def compare_revision_ids(from_revision_id: int, to_revision_id: int, s: Session = Depends(db)):
+    """Compare two revisions when their shared application is implicit."""
+
+    before = s.get(Revision, from_revision_id)
+    after = s.get(Revision, to_revision_id)
+    if not before or not after or before.application_id != after.application_id:
+        raise HTTPException(404, "revisions not found")
+    return _revision_comparison_response(before.application_id, from_revision_id, to_revision_id, s)
+
 @app.get("/revisions/{id}",response_model=RevisionOut)
 def revision_detail(id:int,s:Session=Depends(db)):
     o=s.get(Revision,id)
