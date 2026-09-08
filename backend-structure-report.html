@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resume Builder — Backend Structure Report</title>
+  <style>
+    :root { --ink:#18212b; --muted:#637282; --line:#d9e1e8; --panel:#f5f8fb; --blue:#255da8; --green:#147a57; --amber:#946000; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:#fff; font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1100px; margin:auto; padding:46px 25px 70px; }
+    h1 { font-size:2.2rem; line-height:1.12; margin:0 0 8px; letter-spacing:-.035em; }
+    h2 { font-size:1.32rem; margin:40px 0 13px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+    h3 { font-size:1rem; margin:23px 0 7px; }
+    p { margin:8px 0 13px; } .muted { color:var(--muted); }
+    .hero { padding:21px 23px; border:1px solid #cddcf0; border-left:5px solid var(--blue); background:#f6f9fd; border-radius:7px; }
+    .pill { display:inline-block; margin:0 5px 5px 0; padding:3px 9px; border-radius:20px; color:#174f91; background:#e8f1fd; font-weight:650; font-size:.86rem; }
+    .ok { color:var(--green); font-weight:700; } .warn { color:var(--amber); font-weight:700; }
+    table { width:100%; border-collapse:collapse; margin:11px 0 18px; }
+    th,td { text-align:left; vertical-align:top; padding:10px 11px; border:1px solid var(--line); }
+    th { background:var(--panel); font-size:.88rem; } code { font: .9em ui-monospace,SFMono-Regular,Menlo,monospace; background:#edf1f5; padding:1px 4px; border-radius:3px; }
+    ul { margin:8px 0 15px; padding-left:22px; } li { margin:5px 0; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(265px,1fr)); gap:13px; }
+    .card { padding:16px; border:1px solid var(--line); border-radius:7px; background:#fff; } .card h3 { margin-top:0; }
+    footer { margin-top:45px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Resume Builder backend</h1>
+  <p class="muted">Repository structure and contents report · generated September 7, 2026</p>
+
+  <section class="hero">
+    <strong>What it is:</strong> a local-first FastAPI backend for maintaining verified resume source material, tailoring it to jobs with Codex, reviewing proposed changes, and producing immutable LaTeX/PDF resume revisions. AI output is proposal-only: it cannot silently alter verified source records.
+    <p style="margin-bottom:0;margin-top:12px">
+      <span class="pill">FastAPI</span><span class="pill">SQLite + SQLAlchemy</span><span class="pill">Pydantic</span><span class="pill">Codex CLI</span><span class="pill">Jinja2 + LaTeX</span>
+    </p>
+  </section>
+
+  <h2>Repository layout</h2>
+  <table>
+    <thead><tr><th>Location</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>backend/app/main.py</code></td><td>FastAPI application, SQLAlchemy models, request/response models, routes, workflow orchestration, and SQLite setup.</td></tr>
+      <tr><td><code>backend/app/services/</code></td><td>Codex provider, prompts, structured schemas, validation, rendering, and the canonical LaTeX template.</td></tr>
+      <tr><td><code>backend/tests/</code></td><td>Isolated API, tailoring, provider-contract, renderer, seed/migration, and validation tests.</td></tr>
+      <tr><td><code>backend/seed_checkpoints.py</code></td><td>Checkpoint-resume import and verified-data migration utility.</td></tr>
+      <tr><td><code>checkpoints/</code></td><td>Source resume snapshots used by the importer.</td></tr>
+      <tr><td><code>data/app.db</code></td><td>Local SQLite database created by the application.</td></tr>
+      <tr><td><code>generated/</code></td><td>Per-application LaTeX and PDF artifacts, exposed at <code>/generated</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Persistence model</h2>
+  <div class="grid">
+    <article class="card"><h3>Verified source library</h3><p><code>ContentItem</code> represents experience, projects, education, and activities. <code>Bullet</code> holds rewriteable/locked statements, tags, supporting facts, and preference metadata. <code>Skill</code> stores canonical names, categories, aliases, notes, and verification.</p></article>
+    <article class="card"><h3>Resume composition</h3><p><code>BaseResume</code> stores the template, section order, and layout/contact settings. <code>BaseEntry</code> selects source items and exact bullet IDs in a defined order. Unique constraints prevent duplicate entries within a base resume.</p></article>
+    <article class="card"><h3>Job tailoring</h3><p><code>Application</code>, <code>JobAnalysis</code>, <code>MissingConfirmation</code>, <code>Proposal</code>, and <code>OptimizationRun</code> represent the job, AI analysis, evidence gaps, suggested changes, and an auditable model-run record.</p></article>
+    <article class="card"><h3>Immutable output</h3><p><code>Revision</code> retains a materialized resume snapshot plus optional TeX/PDF paths, page count, and status. Revision numbers are unique per application.</p></article>
+  </div>
+
+  <h2>API surface</h2>
+  <table>
+    <thead><tr><th>Domain</th><th>Endpoints and behavior</th></tr></thead>
+    <tbody>
+      <tr><td>Health and static files</td><td><code>GET /health</code>; static checkpoint and generated-artifact mounts at <code>/checkpoints</code> and <code>/generated</code>.</td></tr>
+      <tr><td>Content library</td><td><code>/content-items</code> provides create/read/update/archive. <code>/content-items/{id}/bullets</code> and <code>/bullets/{id}</code> manage bullets; referenced bullets cannot be deleted.</td></tr>
+      <tr><td>Skills and base resumes</td><td><code>/skills</code>; <code>/base-resumes</code>; <code>/base-resumes/{id}/entries</code>; <code>/base-entries/{id}</code>. Entry bullet ownership and duplicate IDs are validated.</td></tr>
+      <tr><td>Applications</td><td><code>/applications</code> supports creation, status filtering, company/position search, pagination, lookup, and patch updates.</td></tr>
+      <tr><td>AI analysis and auditing</td><td><code>/applications/{id}/analyze</code>, <code>/analysis</code>, <code>/optimization-runs</code>, and <code>/optimization-runs/{id}</code>. Requests may use idempotency keys.</td></tr>
+      <tr><td>Matching and confirmations</td><td><code>/comparison</code> categorizes represented, library-only, and unsupported terms. Missing requirements can be created, listed, and confirmed/rejected.</td></tr>
+      <tr><td>Proposals</td><td>Generate AI proposals, submit manual proposals, list proposals, approve/reject them, and record per-change decisions. Approval rechecks evidence, ownership, locked bullets, and source freshness.</td></tr>
+      <tr><td>Snapshots and rendering</td><td>Build a current snapshot, persist manual revisions, list/get revisions, render TeX, or generate a compiled PDF from an explicitly approved proposal.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Tailoring workflow</h2>
+  <ol>
+    <li>Create an application linked to a base resume and its job description.</li>
+    <li>Analyze the description through the locally authenticated Codex CLI.</li>
+    <li>Compare requirements against the verified library and resolve missing-information prompts.</li>
+    <li>Generate an evidence-grounded proposal; it selects entries and may suggest allowed bullet rewrites.</li>
+    <li>Approve the proposal only after validation. A source fingerprint rejects stale proposals if the library has changed.</li>
+    <li>Generate an immutable revision and compile its TeX/PDF artifact under <code>generated/applications/&lt;id&gt;/revision-&lt;n&gt;/</code>.</li>
+  </ol>
+
+  <h2>Services and safeguards</h2>
+  <table>
+    <thead><tr><th>Component</th><th>Current behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>codex_provider.py</code></td><td>Calls the local authenticated Codex CLI with <code>gpt-5.6-luna</code>, low reasoning, default tier, read-only sandboxing, ephemeral execution, strict output, timeouts, and no OpenAI API keys exposed to the subprocess.</td></tr>
+      <tr><td><code>llm_prompts.py</code> and <code>llm_schemas.py</code></td><td>Versioned prompts and strict Pydantic outputs. Job/resume text is treated as untrusted input, and the model must ground suggested claims in supplied evidence.</td></tr>
+      <tr><td><code>validation.py</code></td><td>Checks snapshot references and duplicate IDs; prevents locked-bullet rewrites; rejects unsupported numeric, technology, and named-entity claims.</td></tr>
+      <tr><td><code>renderer.py</code></td><td>Renders the Jinja2 template with <code>StrictUndefined</code>, escapes LaTeX, invokes <code>latexmk</code>, uses a revision-local TeX cache, and derives page count via <code>pdfinfo</code> with a <code>pypdf</code> fallback.</td></tr>
+      <tr><td>SQLite configuration</td><td>Foreign-key enforcement is enabled for each connection. Schema uniqueness protects base-resume entries and application revision numbering.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Checkpoint import</h2>
+  <p><code>python -m backend.seed_checkpoints</code> parses the checkpoint LaTeX resumes and seeds the local database. Its normal seed path replaces imported records. The <code>--migrate-verified</code> mode is non-destructive: it transactionally backfills contact metadata and evidence-backed rewriteability only for explicit owner-matched, checkpoint-tagged records.</p>
+  <p>Included source folders are <code>baseline-2026-06-16</code>, <code>baseline-2026-07-27</code>, <code>it-resume-2026-06-16</code>, <code>cold-stone-crew-member-2026-07-24</code>, <code>appian-2026-07-30</code>, and <code>vishwa-daycare-resume-2026-08-07</code>.</p>
+
+  <h2>Test coverage and known documentation drift</h2>
+  <p><span class="ok">37 tests currently pass</span>, covering core API behavior, full tailoring and immutable artifacts, Codex contract/error handling, renderer behavior, checkpoint migration safety, and payload validation. The suite emits one Starlette/httpx deprecation warning.</p>
+  <p><span class="warn">Documentation note:</span> <code>PROGRESS.md</code> still says 19/19 tests and lists application update/filter/search/pagination as unfinished. The current code and test suite supersede both statements.</p>
+
+  <h2>Explicitly deferred or incomplete scope</h2>
+  <ul>
+    <li>Frontend development and generic PDF/DOCX/pasted-text ingestion are explicitly out of scope.</li>
+    <li>Future backend work listed in <code>PROGRESS.md</code> includes first-class personal records, source version history, restore/duplicate workflows, normalized skill relationships, application status history, submission tracking, structured requirements/evidence, improved matching scores, revision diffing, and backup/export.</li>
+  </ul>
+
+  <footer>This is a read-only structure report based on the repository’s current backend implementation, documentation, and test suite.</footer>
+</main>
+</body>
+</html>
