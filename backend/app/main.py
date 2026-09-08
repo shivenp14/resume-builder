@@ -112,6 +112,21 @@ def _apply_sqlite_integrity_migrations() -> None:
         revision_columns = {column["name"] for column in inspect(connection).get_columns("revisions")}
         if "generated_at" not in revision_columns:
             connection.execute(text("ALTER TABLE revisions ADD COLUMN generated_at DATETIME"))
+        # A legacy SQLite table cannot gain a foreign key via ADD COLUMN.  A
+        # table rebuild would risk user data, so install equivalent ownership
+        # guards instead.  Invalid legacy pointers are cleared before the
+        # guards are installed; the application remains intact and can be
+        # resubmitted explicitly through the validated API.
+        connection.execute(text("""
+            UPDATE applications
+            SET submitted_revision_id = NULL
+            WHERE submitted_revision_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM revisions AS r
+                  WHERE r.id = applications.submitted_revision_id
+                    AND r.application_id = applications.id
+              )
+        """))
         # ``create_all`` runs before this function for the normal startup
         # path.  This call also handles a pre-migration database that did not
         # yet have the new history table.
@@ -131,6 +146,39 @@ def _apply_sqlite_integrity_migrations() -> None:
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_application_number_idx ON revisions (application_id, revision_number)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_base_entry_resume_item_idx ON base_entries (base_resume_id, content_item_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_application_status_history_application_id ON application_status_history (application_id, created_at)"))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_insert_guard
+            BEFORE INSERT ON applications
+            WHEN NEW.submitted_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM revisions AS r
+                WHERE r.id = NEW.submitted_revision_id AND r.application_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'submitted revision must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_update_guard
+            BEFORE UPDATE OF submitted_revision_id ON applications
+            WHEN NEW.submitted_revision_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM revisions AS r
+                WHERE r.id = NEW.submitted_revision_id AND r.application_id = NEW.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'submitted revision must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS revisions_submitted_revision_delete_guard
+            BEFORE DELETE ON revisions
+            WHEN EXISTS (
+                SELECT 1 FROM applications AS a
+                WHERE a.submitted_revision_id = OLD.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'cannot delete submitted revision');
+            END
+        """))
 
 _apply_sqlite_integrity_migrations()
 def db():
@@ -330,17 +378,32 @@ def delete_entry(id:int,s:Session=Depends(db)):
     if not o: raise HTTPException(404,"base entry not found")
     s.delete(o); s.commit(); return {"deleted":True}
 APPLICATION_STATUSES={"draft","applied","interviewing","offer","rejected","withdrawn"}
+APPLICATION_STATUS_TRANSITIONS={
+    "draft":{"draft","applied","interviewing","offer","rejected","withdrawn"},
+    "applied":{"applied","interviewing","offer","rejected","withdrawn"},
+    "interviewing":{"interviewing","offer","rejected","withdrawn"},
+    "offer":{"offer","rejected","withdrawn"},
+    "rejected":{"rejected"},
+    "withdrawn":{"withdrawn"},
+}
+TERMINAL_APPLICATION_STATUSES={"rejected","withdrawn"}
 
-def _record_status_change(application:Application, to_status:str, s:Session, *, reason:str|None=None) -> ApplicationStatusHistory|None:
-    """Append a status event when the status actually changes.
+def _transition_application(application:Application, to_status:str, s:Session, *, reason:str|None=None, initial:bool=False) -> ApplicationStatusHistory|None:
+    """Validate and apply a lifecycle transition plus its side effects.
 
     The caller owns the surrounding transaction, so an application update and
     its history event commit (or roll back) together.
     """
-    if application.status == to_status:
+    if to_status not in APPLICATION_STATUSES:
+        raise HTTPException(422,"invalid application status")
+    if not initial and to_status not in APPLICATION_STATUS_TRANSITIONS.get(application.status,set()):
+        raise HTTPException(409,f"cannot transition application from {application.status} to {to_status}")
+    if to_status == "applied" and not application.applied_at:
+        application.applied_at=now().isoformat()
+    if not initial and application.status == to_status:
         return None
     event_record=ApplicationStatusHistory(application_id=application.id,
-        from_status=application.status,to_status=to_status,reason=reason)
+        from_status=None if initial else application.status,to_status=to_status,reason=reason)
     application.status=to_status
     s.add(event_record)
     return event_record
@@ -356,23 +419,31 @@ def _submittable_revision(application_id:int, revision_id:int, s:Session) -> Rev
     # completed successfully; failed/generating rows can never be submitted.
     if revision.status not in {"draft","generated"} or not revision.latex_path or not revision.pdf_path or revision.page_count is None:
         raise HTTPException(409,"revision must be successfully generated before submission")
+    artifact_paths=[Path(revision.latex_path),Path(revision.pdf_path)]
+    artifact_paths=[path if path.is_absolute() else ROOT / path for path in artifact_paths]
+    if any(not path.is_file() for path in artifact_paths):
+        raise HTTPException(409,"revision artifacts are missing; generate the revision again before submission")
     return revision
 
 def _submit_revision(application:Application, revision:Revision, s:Session, *, submitted_at:datetime|None=None) -> Application:
+    if application.status in TERMINAL_APPLICATION_STATUSES:
+        raise HTTPException(409,f"cannot submit a revision for {application.status} application")
     application.submitted_revision_id=revision.id
     application.submitted_at=submitted_at or now()
     if not application.applied_at:
         application.applied_at=application.submitted_at.isoformat()
     if application.status == "draft":
-        _record_status_change(application,"applied",s,reason="revision submitted")
+        _transition_application(application,"applied",s,reason="revision submitted")
     return application
 
 @app.post("/applications",response_model=ApplicationOut)
 def add_app(x:AppIn,s:Session=Depends(db)):
     if not s.get(BaseResume,x.base_resume_id): raise HTTPException(404,"base resume not found")
     if x.status not in APPLICATION_STATUSES: raise HTTPException(422,"invalid application status")
-    o=Application(**x.model_dump()); s.add(o); s.flush()
-    s.add(ApplicationStatusHistory(application_id=o.id,from_status=None,to_status=o.status,reason="application created"))
+    values=x.model_dump()
+    requested_status=values.pop("status")
+    o=Application(**values,status="draft"); s.add(o); s.flush()
+    _transition_application(o,requested_status,s,reason="application created",initial=True)
     s.commit(); s.refresh(o); return o
 @app.get("/applications",response_model=list[ApplicationOut])
 def applications(status:str|None=None, q:str|None=None, limit:int=50, offset:int=0, s:Session=Depends(db)):
@@ -394,6 +465,7 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
     if not o: raise HTTPException(404,"application not found")
     changes=x.model_dump(exclude_unset=True)
     status_reason=changes.pop("status_reason",None)
+    has_submitted_revision="submitted_revision_id" in changes
     submitted_revision_id=changes.pop("submitted_revision_id",None)
     required={"company","position","job_description"}
     if any(key in changes and not isinstance(changes[key],str) for key in required):
@@ -404,21 +476,22 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
         raise HTTPException(422,"invalid application status")
     if "base_resume_id" in changes and not s.get(BaseResume,changes["base_resume_id"]):
         raise HTTPException(404,"base resume not found")
+    if has_submitted_revision and submitted_revision_id is None:
+        raise HTTPException(422,"submitted_revision_id cannot be cleared; submit a replacement revision instead")
     if submitted_revision_id is not None:
         revision_to_submit=_submittable_revision(id,submitted_revision_id,s)
         _submit_revision(o,revision_to_submit,s)
     for key,value in changes.items():
         if key != "status": setattr(o,key,value)
     if "status" in changes:
-        _record_status_change(o,changes["status"],s,reason=status_reason)
+        _transition_application(o,changes["status"],s,reason=status_reason)
     s.commit(); s.refresh(o); return o
 
 @app.post("/applications/{id}/status",response_model=ApplicationOut)
 def change_application_status(id:int,x:StatusChangeIn,s:Session=Depends(db)):
     o=s.get(Application,id)
     if not o: raise HTTPException(404,"application not found")
-    if x.status not in APPLICATION_STATUSES: raise HTTPException(422,"invalid application status")
-    _record_status_change(o,x.status,s,reason=x.reason)
+    _transition_application(o,x.status,s,reason=x.reason)
     s.commit(); s.refresh(o); return o
 
 @app.get("/applications/{id}/status-history",response_model=list[StatusHistoryOut])
