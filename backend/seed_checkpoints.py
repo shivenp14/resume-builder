@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.app.main import (ROOT, Application, BaseEntry, BaseResume, Bullet,
-    ContentItem, JobAnalysis, MissingConfirmation, Proposal, Revision,
-    SessionLocal, Skill, analyze_text)
+    BulletVersion, ContentItem, ContentItemVersion, JobAnalysis,
+    MissingConfirmation, Proposal, Revision, SessionLocal, Skill, analyze_text,
+    _append_bullet_version, _append_content_version, _BULLET_VERSION_FIELDS,
+    _CONTENT_VERSION_FIELDS)
 
 CHECKPOINTS = ROOT / "checkpoints"
 PRIMARY = "baseline-2026-07-27"
@@ -95,9 +97,21 @@ def parse_resume(path: Path) -> list[dict]:
                 "organization": organization, "location": location, "start_date": dates, "bullets": bullet_values})
     return records
 
+def _clear_source_history(session) -> None:
+    """Clear histories as part of the intentional destructive seed reset.
+
+    ``seed`` replaces every source row.  Clearing the append-only tables in
+    the same transaction prevents SQLite from reusing a primary key and
+    accidentally associating a new source with the previous source's history.
+    Fresh imported rows receive a new baseline version below.
+    """
+    session.query(BulletVersion).delete(synchronize_session=False)
+    session.query(ContentItemVersion).delete(synchronize_session=False)
+
 def seed() -> None:
     folders = sorted(path for path in CHECKPOINTS.iterdir() if (path / "resume.tex").exists())
     with SessionLocal() as session:
+        _clear_source_history(session)
         for model in (Revision, Proposal, MissingConfirmation, JobAnalysis, Application, BaseEntry, Bullet, ContentItem, Skill, BaseResume):
             session.query(model).delete()
         bases = {}
@@ -115,12 +129,16 @@ def seed() -> None:
                 if item_type not in section_order: section_order.append(item_type)
                 bullets = record.pop("bullets", [])
                 item = ContentItem(**record, tags=[f"checkpoint:{slug}"], is_archived=False)
-                session.add(item); session.flush(); bullet_ids = []
+                session.add(item); session.flush()
+                _append_content_version(session, item, action="created", changed_fields=list(_CONTENT_VERSION_FIELDS))
+                bullet_ids = []
                 for text in bullets:
                     verified=owner=="Shiven Pandya"
                     bullet = Bullet(content_item_id=item.id, text=text, tags=[f"checkpoint:{slug}"],
                         supporting_facts=[text] if verified else [],is_locked=not verified,is_preferred=is_primary)
-                    session.add(bullet); session.flush(); bullet_ids.append(bullet.id)
+                    session.add(bullet); session.flush()
+                    _append_bullet_version(session, bullet, action="created", changed_fields=list(_BULLET_VERSION_FIELDS))
+                    bullet_ids.append(bullet.id)
                 session.add(BaseEntry(base_resume_id=base.id, content_item_id=item.id, selected_bullet_ids=bullet_ids, entry_order=order))
             base.section_order = section_order
         details = (CHECKPOINTS / "appian-2026-07-30" / "job-details.txt").read_text()
@@ -175,9 +193,15 @@ def migrate_verified() -> None:
                     evidence=list(bullet.supporting_facts or [])
                     if not evidence:
                         evidence=[bullet.text]
-                    if evidence != list(bullet.supporting_facts or []) or bullet.is_locked:
+                    changed_fields=[]
+                    if evidence != list(bullet.supporting_facts or []):
                         bullet.supporting_facts=evidence
+                        changed_fields.append("supporting_facts")
+                    if bullet.is_locked:
                         bullet.is_locked=False
+                        changed_fields.append("is_locked")
+                    if changed_fields:
+                        _append_bullet_version(session, bullet, action="updated", changed_fields=changed_fields)
                         updated+=1
     print(f"Migrated {updated} verified checkpoint records.")
 
