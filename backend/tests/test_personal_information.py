@@ -145,16 +145,28 @@ def test_legacy_contact_does_not_stale_canonical_profile_proposal():
 def test_pre_feature_sqlite_schema_gets_personal_column_and_backfill(tmp_path, monkeypatch):
     """Exercise startup migration against a database made before profiles."""
     legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
-    main.Base.metadata.create_all(legacy_engine)
+    # Build the old schema directly. Creating the current ORM schema and
+    # dropping a foreign-key column is not representative and is rejected by
+    # some SQLite versions.
+    legacy_tables = [table for table in main.Base.metadata.sorted_tables
+        if table.name not in {"personal_information", "base_resumes", "base_entries"}]
+    main.Base.metadata.create_all(legacy_engine, tables=legacy_tables)
     with legacy_engine.begin() as connection:
-        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
-        connection.exec_driver_sql("DROP TABLE personal_information")
-        connection.exec_driver_sql("ALTER TABLE base_resumes DROP COLUMN personal_information_id")
+        connection.exec_driver_sql("""
+            CREATE TABLE base_resumes (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR(120) NOT NULL,
+                template_id VARCHAR(80) NOT NULL,
+                section_order JSON NOT NULL,
+                layout_settings JSON NOT NULL
+            )
+        """)
         connection.exec_driver_sql(
             "INSERT INTO base_resumes (name, template_id, section_order, layout_settings) "
             "VALUES (?, ?, ?, ?)",
             ("Legacy", "default", "[]", '{"contact":{"name":"Migrated"}}'),
         )
+    main.BaseEntry.__table__.create(legacy_engine, checkfirst=True)
     monkeypatch.setattr(main, "engine", legacy_engine)
     main._apply_sqlite_integrity_migrations()
 
