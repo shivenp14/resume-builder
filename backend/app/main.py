@@ -3164,10 +3164,13 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
                            "skill_ids":[skill.id for skill in related_skills.values()
                                          if skill.id in {link.skill_id for link in item_skill_links.get(item_id,[])}]}
                          for item_id in item_ids],
-        "bullets":resolved_bullets,"entries":[{"content_item_id":entry["content_item_id"],
-            "bullet_ids":list(entry.get("bullet_ids",[])),
-            "skill_ids":[link.skill_id for link in item_skill_links.get(entry["content_item_id"],[])
-                          if link.skill_id in related_skills]}
+        "bullets":resolved_bullets,"entries":[
+            {"content_item_id":entry["content_item_id"],
+             "bullet_ids":list(entry.get("bullet_ids",[])),
+             **({"skill_ids":skill_ids} if (skill_ids := [
+                 link.skill_id for link in item_skill_links.get(entry["content_item_id"],[])
+                 if link.skill_id in related_skills
+             ]) else {})}
             for entry in selected]}
     if proposal_payload is not None:
         snapshot["provenance"]={"proposal_id":proposal_id,"source_fingerprint":proposal_payload.get("source_fingerprint"),

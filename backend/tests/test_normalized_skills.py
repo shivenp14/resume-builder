@@ -138,7 +138,7 @@ def test_unverified_source_relationship_is_excluded_from_snapshot_and_fingerprin
         app_record = session.get(main.Application, application["id"])
         context = main._verified_context(app_record, session)
         assert context["verified_library"]["source_skills"] == []
-        assert context["base_snapshot"]["entries"][0]["skill_ids"] == []
+        assert "skill_ids" not in context["base_snapshot"]["entries"][0]
         fingerprint = context["source_fingerprint"]
         link = session.query(ContentItemSkill).filter_by(
             content_item_id=item["id"], skill_id=unverified["id"]
