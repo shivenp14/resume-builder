@@ -31,11 +31,13 @@ def display_skill_name(value: object) -> str:
 def normalize_skill_name(value: object) -> str:
     """Return the stable key used for equality and relationship matching.
 
-    Whitespace and ordinary separators are normalized, so ``Node.js`` and
-    ``node js`` deliberately share a key.  Programming language markers are
-    retained, which keeps ``C++`` and ``C#`` distinct rather than collapsing
-    both to ``c``.  This still errs on the side of requiring an explicit alias
-    for spellings that are not ordinary separator variants.
+    Whitespace, dots, slashes, and backslashes are treated as separators, so
+    ``Node.js`` and ``node js`` deliberately share a key.  Hyphens are kept
+    as meaningful characters (``React-Native`` is not silently merged with
+    ``React Native``), and programming-language markers are retained, which
+    keeps ``C++`` and ``C#`` distinct rather than collapsing both to ``c``.
+    This errs on the side of requiring an explicit alias for non-equivalent
+    spellings.
     """
 
     value = display_skill_name(value).casefold()

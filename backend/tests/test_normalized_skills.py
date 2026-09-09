@@ -26,6 +26,7 @@ def test_aliases_are_normalized_and_collisions_are_rejected():
 
     assert normalize_skill_name(" PY ") == "py"
     assert normalize_skill_name("Node.js") == normalize_skill_name("node js")
+    assert normalize_skill_name("React-Native") != normalize_skill_name("React Native")
     assert normalize_skill_name("C++") != normalize_skill_name("C#")
 
 
