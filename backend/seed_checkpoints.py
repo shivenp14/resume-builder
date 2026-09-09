@@ -8,9 +8,9 @@ from pathlib import Path
 
 from backend.app.main import (ROOT, Application, BaseEntry, BaseResume, Bullet,
     BulletVersion, ContentItem, ContentItemVersion, JobAnalysis,
-    MissingConfirmation, Proposal, Revision, SessionLocal, Skill, analyze_text,
+    MissingConfirmation, PersonalInformation, Proposal, Revision, SessionLocal, Skill, analyze_text,
     _append_bullet_version, _append_content_version, _BULLET_VERSION_FIELDS,
-    _CONTENT_VERSION_FIELDS)
+    _CONTENT_VERSION_FIELDS, _contact_to_personal_values, _backfill_legacy_contacts)
 
 CHECKPOINTS = ROOT / "checkpoints"
 PRIMARY = "baseline-2026-07-27"
@@ -112,18 +112,24 @@ def seed() -> None:
     folders = sorted(path for path in CHECKPOINTS.iterdir() if (path / "resume.tex").exists())
     with SessionLocal() as session:
         _clear_source_history(session)
-        for model in (Revision, Proposal, MissingConfirmation, JobAnalysis, Application, BaseEntry, Bullet, ContentItem, Skill, BaseResume):
+        for model in (Revision, Proposal, MissingConfirmation, JobAnalysis, Application, BaseEntry, Bullet, ContentItem, Skill, BaseResume, PersonalInformation):
             session.query(model).delete()
         bases = {}
         for folder in folders:
             slug, is_primary = folder.name, folder.name == PRIMARY
             pdf_file = next(iter(sorted(folder.glob("*.pdf"))))
             owner = "Vishwa Pandya" if slug.startswith("vishwa-") else "Shiven Pandya"
+            contact=parse_contact(folder/"resume.tex")
             base = BaseResume(name=DISPLAY_NAMES.get(slug, slug.replace("-", " ").title()), template_id="latex-checkpoint",
                 section_order=[], layout_settings={"primary": is_primary, "owner":owner,
-                "contact":parse_contact(folder/"resume.tex"),"checkpoint": slug,
+                "contact":contact,"checkpoint": slug,
                 "pdf_path": pdf_file.relative_to(ROOT).as_posix()})
-            session.add(base); session.flush(); bases[slug] = base; section_order = []
+            session.add(base); session.flush()
+            personal_values=_contact_to_personal_values(contact)
+            personal_values["is_primary"]=is_primary
+            personal=PersonalInformation(**personal_values)
+            session.add(personal); session.flush(); base.personal_information_id=personal.id
+            bases[slug] = base; section_order = []
             for order, record in enumerate(parse_resume(folder / "resume.tex")):
                 item_type = record.get("type", "other")
                 if item_type not in section_order: section_order.append(item_type)
@@ -203,6 +209,7 @@ def migrate_verified() -> None:
                     if changed_fields:
                         _append_bullet_version(session, bullet, action="updated", changed_fields=changed_fields)
                         updated+=1
+        updated += _backfill_legacy_contacts(session)
     print(f"Migrated {updated} verified checkpoint records.")
 
 if __name__ == "__main__":

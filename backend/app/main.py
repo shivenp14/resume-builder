@@ -45,9 +45,30 @@ class Bullet(Base):
 class Skill(Base):
     __tablename__="skills"
     id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120),unique=True); category: Mapped[str|None]=mapped_column(String(80)); aliases: Mapped[list]=mapped_column(JSON,default=list); notes: Mapped[str|None]=mapped_column(Text); verified: Mapped[bool]=mapped_column(Boolean,default=False)
+class PersonalInformation(Base):
+    """Typed, reusable contact/profile data for a resume.
+
+    Older databases kept this data in ``base_resumes.layout_settings`` under
+    ``contact``.  The legacy value remains readable for compatibility, while
+    this row is now the canonical editable source for snapshots and proposals.
+    """
+    __tablename__="personal_information"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    name: Mapped[str|None]=mapped_column(String(200),nullable=True)
+    location: Mapped[str|None]=mapped_column(String(200),nullable=True)
+    email: Mapped[str|None]=mapped_column(String(320),nullable=True)
+    phone: Mapped[str|None]=mapped_column(String(80),nullable=True)
+    linkedin: Mapped[str|None]=mapped_column(String(500),nullable=True)
+    github: Mapped[str|None]=mapped_column(String(500),nullable=True)
+    website: Mapped[str|None]=mapped_column(String(500),nullable=True)
+    summary: Mapped[str|None]=mapped_column(Text,nullable=True)
+    notes: Mapped[str|None]=mapped_column(Text,nullable=True)
+    is_primary: Mapped[bool]=mapped_column(Boolean,default=False)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
 class BaseResume(Base):
     __tablename__="base_resumes"
-    id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); template_id: Mapped[str]=mapped_column(String(80),default="default"); section_order: Mapped[list]=mapped_column(JSON,default=list); layout_settings: Mapped[dict]=mapped_column(JSON,default=dict)
+    id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); template_id: Mapped[str]=mapped_column(String(80),default="default"); section_order: Mapped[list]=mapped_column(JSON,default=list); layout_settings: Mapped[dict]=mapped_column(JSON,default=dict); personal_information_id: Mapped[int|None]=mapped_column(ForeignKey("personal_information.id"),nullable=True)
 class BaseEntry(Base):
     __tablename__="base_entries"
     __table_args__=(UniqueConstraint("base_resume_id", "content_item_id", name="uq_base_entry_resume_item"),)
@@ -139,6 +160,55 @@ def _bullet_snapshot(bullet: Bullet) -> dict[str,Any]:
         "tags":list(bullet.tags or []),"supporting_facts":list(bullet.supporting_facts or []),
         "is_locked":bool(bullet.is_locked),"is_preferred":bool(bullet.is_preferred)}
 
+_PERSONAL_INFORMATION_FIELDS=("name","location","email","phone","linkedin","github","website","summary","notes","is_primary")
+
+def _contact_to_personal_values(contact: Any) -> dict[str,Any]:
+    """Normalize a legacy layout contact dictionary into typed columns."""
+    contact = contact if isinstance(contact, dict) else {}
+    return {
+        "name": contact.get("name") or contact.get("full_name"),
+        "location": contact.get("location"),
+        "email": contact.get("email"),
+        "phone": contact.get("phone"),
+        "linkedin": contact.get("linkedin"),
+        "github": contact.get("github"),
+        "website": contact.get("website") or contact.get("portfolio"),
+        "summary": contact.get("summary"),
+        "notes": contact.get("notes"),
+        "is_primary": bool(contact.get("is_primary", False)),
+    }
+
+def _personal_contact(personal: PersonalInformation|None, legacy: Any = None) -> dict[str,Any]:
+    """Return the stable contact shape consumed by snapshots and templates."""
+    if personal is None:
+        values=_contact_to_personal_values(legacy)
+    else:
+        values={field:getattr(personal,field) for field in _PERSONAL_INFORMATION_FIELDS}
+    # Metadata fields are useful in the source API, but should not leak into
+    # the renderer's contact line.
+    presentation={"name","location","email","phone","linkedin","github","website"}
+    result={key:value for key,value in values.items() if key in presentation and value not in (None, "")}
+    if personal is None and isinstance(legacy,dict) and legacy.get("linkedin_label"):
+        result["linkedin_label"]=legacy["linkedin_label"]
+    return result
+
+def _backfill_legacy_contacts(session: Session) -> int:
+    """Create/link one typed record for each legacy contact exactly once."""
+    created=0
+    for base in session.query(BaseResume).all():
+        if base.personal_information_id:
+            continue
+        settings=dict(base.layout_settings or {})
+        if "contact" not in settings:
+            continue
+        values=_contact_to_personal_values(settings.get("contact"))
+        values["is_primary"]=bool(settings.get("primary", values.get("is_primary", False)))
+        personal=PersonalInformation(**values)
+        session.add(personal); session.flush()
+        base.personal_information_id=personal.id
+        created += 1
+    return created
+
 def _append_content_version(s: Session, item: ContentItem, *, action: str, changed_fields: list[str]) -> ContentItemVersion:
     """Append a source snapshot; callers must commit the enclosing mutation."""
     number=(s.query(func.max(ContentItemVersion.version_number))
@@ -197,6 +267,9 @@ def _apply_sqlite_integrity_migrations() -> None:
         for name, declaration in columns.items():
             if name not in existing:
                 connection.execute(text(f"ALTER TABLE applications ADD COLUMN {name} {declaration}"))
+        base_resume_columns = {column["name"] for column in inspect(connection).get_columns("base_resumes")}
+        if "personal_information_id" not in base_resume_columns:
+            connection.execute(text("ALTER TABLE base_resumes ADD COLUMN personal_information_id INTEGER"))
         revision_columns = {column["name"] for column in inspect(connection).get_columns("revisions")}
         if "generated_at" not in revision_columns:
             connection.execute(text("ALTER TABLE revisions ADD COLUMN generated_at DATETIME"))
@@ -235,6 +308,7 @@ def _apply_sqlite_integrity_migrations() -> None:
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_base_entry_resume_item_idx ON base_entries (base_resume_id, content_item_id)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_content_item_version_number_idx ON content_item_versions (content_item_id, version_number)"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_bullet_version_number_idx ON bullet_versions (bullet_id, version_number)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_base_resumes_personal_information_id ON base_resumes (personal_information_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_application_status_history_application_id ON application_status_history (application_id, created_at)"))
         connection.execute(text("""
             CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_insert_guard
@@ -286,6 +360,7 @@ def _apply_sqlite_integrity_migrations() -> None:
     # idempotent and never rewrites existing history.
     MigrationSession=sessionmaker(bind=engine,expire_on_commit=False)
     with MigrationSession() as session:
+        _backfill_legacy_contacts(session)
         for item in session.query(ContentItem).all():
             if not session.query(ContentItemVersion.id).filter_by(content_item_id=item.id).first():
                 _append_content_version(session,item,action="backfill",changed_fields=list(_CONTENT_VERSION_FIELDS))
@@ -305,7 +380,40 @@ class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organizatio
 class DuplicateItemIn(BaseModel): title:str|None=None
 class BulletIn(BaseModel): text:str; tags:list[str]=Field(default_factory=list); supporting_facts:list[str]=Field(default_factory=list); is_locked:bool=False; is_preferred:bool=False
 class SkillIn(BaseModel): name:str; category:str|None=None; aliases:list[str]=Field(default_factory=list); notes:str|None=None; verified:bool=False
-class ResumeIn(BaseModel): name:str; template_id:str="default"; section_order:list[str]=Field(default_factory=list); layout_settings:dict=Field(default_factory=dict)
+class PersonalInformationIn(BaseModel):
+    name:str|None=None
+    location:str|None=None
+    email:str|None=None
+    phone:str|None=None
+    linkedin:str|None=None
+    github:str|None=None
+    website:str|None=None
+    summary:str|None=None
+    notes:str|None=None
+    is_primary:bool=False
+class PersonalInformationPatch(BaseModel):
+    name:str|None=None
+    location:str|None=None
+    email:str|None=None
+    phone:str|None=None
+    linkedin:str|None=None
+    github:str|None=None
+    website:str|None=None
+    summary:str|None=None
+    notes:str|None=None
+    is_primary:bool|None=None
+# Short names keep integrations ergonomic while the longer class name remains
+# the canonical public contract.
+PersonalInfo = PersonalInformation
+Profile = PersonalInformation
+PersonalInfoIn = PersonalInformationIn
+PersonalInfoPatch = PersonalInformationPatch
+class ResumeIn(BaseModel):
+    name:str
+    template_id:str="default"
+    section_order:list[str]=Field(default_factory=list)
+    layout_settings:dict=Field(default_factory=dict)
+    personal_information_id:int|None=None
 class EntryIn(BaseModel): content_item_id:int; selected_bullet_ids:list[int]=Field(default_factory=list); entry_order:int=0
 class AppIn(BaseModel):
     company:str
@@ -376,7 +484,9 @@ class BulletOut(APIOut):
     id:int; content_item_id:int; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool
 class ContentItemWithBulletsOut(ContentItemOut): bullets:list[BulletOut] = Field(default_factory=list)
 class SkillOut(APIOut): id:int; name:str; category:str|None; aliases:list[str]; notes:str|None; verified:bool
-class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]
+class PersonalInformationOut(APIOut):
+    id:int; name:str|None; location:str|None; email:str|None; phone:str|None; linkedin:str|None; github:str|None; website:str|None; summary:str|None; notes:str|None; is_primary:bool; created_at:datetime; updated_at:datetime
+class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]; personal_information_id:int|None
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
 class ApplicationOut(APIOut):
     id:int; company:str; position:str; job_url:str|None; job_description:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
@@ -596,9 +706,64 @@ def add_skill(x:SkillIn,s:Session=Depends(db)):
     o=Skill(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/skills",response_model=list[SkillOut])
 def skills(s:Session=Depends(db)): return s.query(Skill).all()
+
+@app.post("/personal-information",response_model=PersonalInformationOut)
+@app.post("/personal-info",response_model=PersonalInformationOut,include_in_schema=False)
+def add_personal_information(x:PersonalInformationIn,s:Session=Depends(db)):
+    values=x.model_dump()
+    if values.get("is_primary"):
+        s.query(PersonalInformation).update({PersonalInformation.is_primary:False},synchronize_session=False)
+    o=PersonalInformation(**values); s.add(o); s.commit(); s.refresh(o); return o
+
+@app.get("/personal-information",response_model=list[PersonalInformationOut])
+@app.get("/personal-info",response_model=list[PersonalInformationOut],include_in_schema=False)
+def personal_information(s:Session=Depends(db)):
+    return s.query(PersonalInformation).order_by(PersonalInformation.id).all()
+
+@app.get("/personal-information/{id}",response_model=PersonalInformationOut)
+@app.get("/personal-info/{id}",response_model=PersonalInformationOut,include_in_schema=False)
+def personal_information_record(id:int,s:Session=Depends(db)):
+    o=s.get(PersonalInformation,id)
+    if not o: raise HTTPException(404,"personal information not found")
+    return o
+
+@app.patch("/personal-information/{id}",response_model=PersonalInformationOut)
+@app.put("/personal-information/{id}",response_model=PersonalInformationOut,include_in_schema=False)
+@app.patch("/personal-info/{id}",response_model=PersonalInformationOut,include_in_schema=False)
+@app.put("/personal-info/{id}",response_model=PersonalInformationOut,include_in_schema=False)
+def edit_personal_information(id:int,x:PersonalInformationPatch,s:Session=Depends(db)):
+    o=s.get(PersonalInformation,id)
+    if not o: raise HTTPException(404,"personal information not found")
+    values=x.model_dump(exclude_unset=True)
+    if values.get("is_primary"):
+        s.query(PersonalInformation).filter(PersonalInformation.id != id).update(
+            {PersonalInformation.is_primary:False},synchronize_session=False)
+    for key,value in values.items(): setattr(o,key,value)
+    o.updated_at=now(); s.commit(); s.refresh(o); return o
+
+@app.delete("/personal-information/{id}",response_model=MutationOut)
+@app.delete("/personal-info/{id}",response_model=MutationOut,include_in_schema=False)
+def delete_personal_information(id:int,s:Session=Depends(db)):
+    o=s.get(PersonalInformation,id)
+    if not o: raise HTTPException(404,"personal information not found")
+    if s.query(BaseResume).filter_by(personal_information_id=id).first():
+        raise HTTPException(409,"personal information is linked to a base resume")
+    s.delete(o); s.commit(); return {"deleted":True}
+
+def _prepare_resume_personal_information(values:dict[str,Any],s:Session, *, migrate_legacy:bool=True) -> dict[str,Any]:
+    personal_id=values.get("personal_information_id")
+    if personal_id is not None and not s.get(PersonalInformation,personal_id):
+        raise HTTPException(404,"personal information not found")
+    if migrate_legacy and personal_id is None and "contact" in (values.get("layout_settings") or {}):
+        personal=PersonalInformation(**_contact_to_personal_values(values["layout_settings"].get("contact")))
+        s.add(personal); s.flush(); values["personal_information_id"]=personal.id
+    return values
+
 @app.post("/base-resumes",response_model=BaseResumeOut)
 def add_resume(x:ResumeIn,s:Session=Depends(db)):
-    o=BaseResume(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
+    values=_prepare_resume_personal_information(x.model_dump(),s,
+        migrate_legacy="personal_information_id" not in x.model_fields_set)
+    o=BaseResume(**values); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/base-resumes",response_model=list[BaseResumeOut])
 def resumes(s:Session=Depends(db)):
     records=s.query(BaseResume).all()
@@ -612,7 +777,20 @@ def resume(id:int,s:Session=Depends(db)):
 def edit_resume(id:int,x:ResumeIn,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
     if not o: raise HTTPException(404,"base resume not found")
-    for k,v in x.model_dump().items(): setattr(o,k,v)
+    values=x.model_dump()
+    explicit_personal_information="personal_information_id" in x.model_fields_set
+    if not explicit_personal_information and o.personal_information_id is not None:
+        values["personal_information_id"]=o.personal_information_id
+    elif explicit_personal_information and values.get("personal_information_id") is None:
+        # A durable unlink must not leave the legacy contact payload around:
+        # startup backfill would otherwise interpret it as an un-migrated
+        # record and immediately re-link the profile.
+        settings=dict(values.get("layout_settings") or {})
+        settings.pop("contact",None)
+        values["layout_settings"]=settings
+    values=_prepare_resume_personal_information(values,s,
+        migrate_legacy=not explicit_personal_information)
+    for k,v in values.items(): setattr(o,k,v)
     s.commit(); return o
 @app.post("/base-resumes/{id}/entries",response_model=BaseEntryOut)
 def add_entry(id:int,x:EntryIn,s:Session=Depends(db)):
@@ -816,6 +994,7 @@ def _run_error(exc):
 
 def _verified_context(a:Application,s:Session) -> dict[str,Any]:
     base=s.get(BaseResume,a.base_resume_id)
+    personal=s.get(PersonalInformation,base.personal_information_id) if base and base.personal_information_id else None
     entries=s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id).order_by(BaseEntry.entry_order).all()
     # Archived records are excluded from the active library, but an existing
     # base resume must continue to resolve its historical references.  This
@@ -841,7 +1020,14 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
             "notes":skill.notes,"verified":skill.verified}
             for skill in s.query(Skill).filter_by(verified=True).order_by(Skill.id)],
     }
-    source={"base_resume":{"id":base.id,"section_order":base.section_order,"layout_settings":base.layout_settings},
+    layout_settings=dict(base.layout_settings or {})
+    # Once a typed record is linked, legacy contact metadata is only a
+    # migration fallback and must not keep proposals stale. Hash only the
+    # renderable projection, never private/non-render profile fields.
+    legacy_contact=layout_settings.pop("contact",None)
+    canonical_contact=_personal_contact(personal) if personal else _personal_contact(None,legacy_contact)
+    source={"base_resume":{"id":base.id,"section_order":base.section_order,"layout_settings":layout_settings,
+        "personal_information_id":base.personal_information_id,"contact":canonical_contact},
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
     fingerprint=hashlib.sha256(json.dumps(source,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
@@ -1115,10 +1301,15 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
         elif key in grouped:
             title={"project":"Projects"}.get(key,key.replace("_"," ").title())
             sections.append({"key":key,"title":title,"entries":grouped[key]})
-    contact=dict((base.layout_settings or {}).get("contact") or {})
-    linkedin=contact.get("linkedin","")
-    if linkedin and not linkedin.startswith(("http://","https://")):
-        contact["linkedin_label"]=linkedin.rstrip("/"); contact["linkedin"]="https://"+linkedin
+    personal=s.get(PersonalInformation,base.personal_information_id) if base and base.personal_information_id else None
+    contact=_personal_contact(personal,(base.layout_settings or {}).get("contact"))
+    for field in ("linkedin","github","website"):
+        value=contact.get(field,"")
+        if value and not contact.get(f"{field}_label"):
+            contact[f"{field}_label"]=value.removeprefix("https://").removeprefix("http://").rstrip("/")
+        if value and not value.startswith(("http://","https://")):
+            contact[f"{field}_label"]=value.rstrip("/")
+            contact[field]="https://"+value
     snapshot={"contact":contact,"sections":sections,
         "content_items":[{"id":items[item_id].id,"title":items[item_id].title} for item_id in item_ids],
         "bullets":resolved_bullets,"entries":[{"content_item_id":entry["content_item_id"],
