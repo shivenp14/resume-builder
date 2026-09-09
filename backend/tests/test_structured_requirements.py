@@ -95,6 +95,18 @@ def test_comparison_confirmations_and_proposal_context_use_requirement_ids(clien
     assert str(python["requirement_id"]) in seen["evidence_by_requirement"]
 
 
+def test_structured_unsupported_status_is_distinct_from_legacy_array_status(client):
+    application, _, _, _ = _application(client)
+    client.post(f"/applications/{application['id']}/analyze")
+    comparison = client.get(f"/applications/{application['id']}/comparison").json()
+
+    docker = next(row for row in comparison["requirements"] if row["text"].casefold() == "docker")
+    legacy = next(row for row in comparison["unsupported"] if row["requirement"].casefold() == "docker")
+    assert docker["classification"] == "unsupported"
+    assert docker["status"] == "unsupported"
+    assert legacy["status"] == "unresolved"
+
+
 def test_generated_proposal_persists_requirement_evidence_associations(client, monkeypatch):
     from backend.app.services.llm_schemas import ProposalOutput
 
