@@ -6,6 +6,7 @@ are never silently changed by analysis or optimization.
 from datetime import datetime, timezone
 import copy, hashlib, json, re
 from pathlib import Path
+import threading
 from typing import Any, Literal
 import uuid
 from fastapi import FastAPI, Depends, HTTPException
@@ -21,11 +22,19 @@ from .services.llm_prompts import PROMPT_VERSION
 from .services.llm_schemas import SCHEMA_VERSION
 from .services.revision_comparison import compare_snapshots
 from .services.skills import SkillNormalizationError, display_skill_name, normalize_skill_name
+from .services.matching import (
+    SCORING_VERSION,
+    WELL_REPRESENTED_THRESHOLD,
+    WEAKLY_REPRESENTED_THRESHOLD,
+    score_requirement,
+)
+from .services.backup import BackupError, create_backup as create_backup_archive, list_backups as list_backup_archives
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+OPERATION_BARRIER = threading.RLock()
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_foreign_keys(connection, _record):
@@ -409,11 +418,19 @@ def _upsert_requirement(s: Session, application_id: int, payload: dict[str,Any])
     if requirement is None:
         requirement = JobRequirement(application_id=application_id, normalized_key=key)
         s.add(requirement)
-    requirement.text = payload["text"]
-    requirement.category = payload["category"]
-    requirement.priority = payload["priority"]
-    requirement.source_text = payload.get("source_text")
-    requirement.is_active = True
+    # Avoid marking an unchanged legacy row dirty during a read-only
+    # comparison fallback.  This keeps ``updated_at`` and the source
+    # fingerprint stable across repeated recomputations.
+    values = {
+        "text": payload["text"],
+        "category": payload["category"],
+        "priority": payload["priority"],
+        "source_text": payload.get("source_text"),
+        "is_active": True,
+    }
+    for field, value in values.items():
+        if getattr(requirement, field) != value:
+            setattr(requirement, field, value)
     s.flush()
     return requirement
 
@@ -1033,9 +1050,12 @@ def _apply_sqlite_integrity_migrations() -> None:
 
 _apply_sqlite_integrity_migrations()
 def db():
-    s=SessionLocal()
-    try: yield s
-    finally: s.close()
+    # Hold the barrier for the complete request, not just session creation,
+    # so a backup cannot race a route that mutates SQLite or generated paths.
+    with OPERATION_BARRIER:
+        s=SessionLocal()
+        try: yield s
+        finally: s.close()
 
 class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list); skill_ids:list[int]=Field(default_factory=list)
 class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None; skill_ids:list[int]|None=None
@@ -1255,10 +1275,25 @@ class BulletVersionOut(APIOut):
     id:int; bullet_id:int; content_item_id:int; version_number:int; version:int; action:str; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool; changed_fields:list[str]; snapshot:dict[str,Any]; created_at:datetime
 class ComparisonOut(APIOut):
     well_represented:list[str]; weakly_represented:list[str]; library_only:list[str]; unsupported:list[dict[str,Any]]; requirements:list[dict[str,Any]]=Field(default_factory=list)
+    # Matching is recomputed from the current source projection on every GET.
+    # These fields make the rule version and source snapshot explicit without
+    # changing the legacy category arrays above.
+    scoring_version:str|None=None
+    score_thresholds:dict[str,int]=Field(default_factory=dict)
+    source_fingerprint:str|None=None
 class SnapshotOut(APIOut):
     contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; provenance:dict[str,Any]|None=None
 class GenerationOut(RevisionOut): proposal_id:int; latex_url:str; pdf_url:str
 class RenderOut(APIOut): latex:str
+class BackupOut(APIOut):
+    filename:str
+    backup_version:int
+    format_version:int
+    schema_version:str
+    created_at:datetime
+    size:int
+    sha256:str
+    artifact_count:int
 
 def _content_version_response(version: ContentItemVersion) -> dict[str,Any]:
     return {column.name:getattr(version,column.name) for column in ContentItemVersion.__table__.columns} | {
@@ -1275,6 +1310,49 @@ app.mount("/generated", StaticFiles(directory=GENERATED), name="generated")
 app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="checkpoints")
 @app.get("/health",response_model=HealthOut)
 def health(): return {"status":"ok"}
+
+
+def _active_database_path() -> Path:
+    """Resolve the database currently used by the SQLAlchemy engine."""
+    database = engine.url.database
+    if database and database != ":memory:":
+        path = Path(database)
+        return path if path.is_absolute() else Path.cwd() / path
+    return DB_PATH
+
+
+def _backup_root() -> Path:
+    return ROOT / "data" / "backups"
+
+
+@app.post("/backups", response_model=BackupOut, status_code=201)
+def create_backup_endpoint():
+    """Create a local, checksummed SQLite-and-artifacts backup.
+
+    The response contains metadata only. The archive remains on the local
+    machine under ``data/backups`` and is never streamed through this API.
+    """
+    with OPERATION_BARRIER:
+        try:
+            record = create_backup_archive(
+                database_path=_active_database_path(),
+                generated_root=GENERATED,
+                backup_root=_backup_root(),
+            )
+            return {key: value for key, value in record.items() if key != "path"}
+        except BackupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/backups", response_model=list[BackupOut])
+def list_backups_endpoint():
+    with OPERATION_BARRIER:
+        try:
+            return list_backup_archives(backup_root=_backup_root())
+        except BackupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.post("/content-items",response_model=ContentItemOut)
 def create_item(x:ItemIn,s:Session=Depends(db)):
     values=x.model_dump(); skill_ids=values.pop("skill_ids",[])
@@ -2313,56 +2391,105 @@ def _comparison(a:Application,s:Session):
                 row=_upsert_requirement(s,a.id,payload)
                 if row.id not in seen_rows:
                     selected_rows.append(row); seen_rows.add(row.id)
-    base_ids={e.content_item_id for e in s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id)}
+    base_entries=s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id).order_by(BaseEntry.entry_order,BaseEntry.id).all()
+    base_ids={e.content_item_id for e in base_entries}
     item_query=s.query(ContentItem)
     if base_ids:
         item_query=item_query.filter(or_(ContentItem.is_archived.is_(False), ContentItem.id.in_(base_ids)))
     else:
         item_query=item_query.filter_by(is_archived=False)
-    all_items=item_query.all()
-    item_skill_links=_item_skill_links([item.id for item in all_items],s)
-    skill_index=_skill_name_index(s)
+    all_items=item_query.order_by(ContentItem.id).all()
+    item_ids=[item.id for item in all_items]
+    item_skill_links=_item_skill_links(item_ids,s)
+    all_bullets=(s.query(Bullet).filter(Bullet.content_item_id.in_(item_ids)).order_by(Bullet.id).all()
+                 if item_ids else [])
+    bullets_by_item:dict[int,list[Bullet]]={item_id:[] for item_id in item_ids}
+    for bullet in all_bullets:
+        bullets_by_item.setdefault(bullet.content_item_id,[]).append(bullet)
+    # Matching only uses verified skills, while preserving all relationships in
+    # the source library for compatibility with callers that inspect them.
+    verified_skill_rows=s.query(Skill).filter_by(verified=True).order_by(Skill.id).all()
+    # Use the serialized skill projection so normalized relational aliases and
+    # legacy JSON aliases are both available to the pure matcher.
+    verified_skills=[_skill_response(skill,s) for skill in verified_skill_rows]
+    relationships_by_item={
+        item_id:{link.skill_id for link in links if any(skill["id"] == link.skill_id for skill in verified_skills)}
+        for item_id, links in item_skill_links.items()
+    }
+    evidence_by_requirement={
+        row.id:s.query(RequirementEvidenceLink).filter_by(requirement_id=row.id).order_by(RequirementEvidenceLink.id).all()
+        for row in selected_rows
+    }
     represented=[]; weak=[]; library_only=[]; unsupported=[]; structured=[]
     for requirement in selected_rows:
         term=requirement.text
-        matching_skill_ids=set()
-        candidates=[term,*re.findall(r"[A-Za-z][A-Za-z0-9+#.-]*",term)]
-        for candidate in candidates:
-            try:
-                matching_skill_ids.update(skill_index.get(normalize_skill_name(candidate),set()))
-            except SkillNormalizationError:
-                continue
-        hits=[i for i in all_items if (
-            any(link.skill_id in matching_skill_ids for link in item_skill_links.get(i.id,[]))
-            or term.casefold() in ((i.title or '')+' '+(i.summary or '')).casefold()
-            or any(term.casefold() in b.text.casefold() for b in i.bullets)
-        )]
-        link_rows=s.query(RequirementEvidenceLink).filter_by(requirement_id=requirement.id).order_by(RequirementEvidenceLink.id).all()
+        link_rows=evidence_by_requirement.get(requirement.id,[])
         evidence_payload=[_evidence_response(link,s) for link in link_rows]
-        if not hits and evidence_payload:
-            evidence_item_ids={link.content_item_id for link in link_rows if link.content_item_id is not None}
-            hits=[item for item in all_items if item.id in evidence_item_ids]
-        # A standalone verified skill is still durable library evidence even
-        # when the user has not attached it to a particular experience.
-        # Treat it as library-only rather than re-reporting the requirement as
-        # unsupported after confirmation.
-        if not hits and any(link.skill_id is not None for link in link_rows):
-            status="library_only"
+        scored=score_requirement(
+            requirement,
+            items=all_items,
+            bullets_by_item=bullets_by_item,
+            base_entries=base_entries,
+            relationships_by_item=relationships_by_item,
+            skills=verified_skills,
+            evidence_links=link_rows,
+        )
+        classification=scored["classification"]
+        if classification == "well_represented":
+            represented.append(term)
+        elif classification == "weakly_represented":
+            weak.append(term)
+        elif classification == "library_only":
             library_only.append(term)
-            structured.append({**_requirement_response(requirement,s),"status":status})
-            continue
-        if not hits:
-            status="unsupported"
-            unsupported.append({"requirement_id":requirement.id,"requirement_key":requirement.normalized_key,"requirement":term,"status":"unresolved","evidence_links":evidence_payload})
-        elif any(i.id in base_ids for i in hits):
-            status="represented"; represented.append(term)
-        else:
-            status="library_only"; library_only.append(term)
-        structured.append({**_requirement_response(requirement,s),"status":status})
+        base_record={**_requirement_response(requirement,s),**scored}
+        if classification == "unsupported":
+            # The structured requirement projection uses the canonical
+            # classification.  The legacy ``unsupported`` array below keeps
+            # its historical ``unresolved`` status for existing clients.
+            base_record["legacy_status"] = base_record["status"]
+            base_record["status"] = "unsupported"
+        # Keep the old unresolved status in the unsupported bucket while the
+        # structured record exposes the finer-grained ``classification``.
+        if classification == "unsupported":
+            unsupported.append({
+                "requirement_id":requirement.id,
+                "requirement_key":requirement.normalized_key,
+                "requirement":term,
+                "status":"unresolved",
+                "classification":classification,
+                "match_classification":classification,
+                "score":scored["score"],
+                "match_score":scored["match_score"],
+                "score_percent":scored["score_percent"],
+                "normalized_score":scored["normalized_score"],
+                "score_breakdown":scored["score_breakdown"],
+                "matched_content_item_ids":scored["matched_content_item_ids"],
+                "matched_bullet_ids":scored["matched_bullet_ids"],
+                "matched_skills":scored["matched_skills"],
+                "match_reasons":scored["match_reasons"],
+                "evidence_ids":scored["evidence_ids"],
+                "evidence_links":evidence_payload,
+            })
+        structured.append(base_record)
+    # ``_verified_context`` is intentionally evaluated after requirement rows
+    # are selected: it hashes the complete current verified source projection,
+    # including requirement/evidence edits.  No comparison result is cached;
+    # a later GET therefore recomputes against this fingerprint's source.
+    source_fingerprint=_verified_context(a,s)["source_fingerprint"]
+    for record in structured:
+        record["source_fingerprint"] = source_fingerprint
+    for record in unsupported:
+        record["source_fingerprint"] = source_fingerprint
     # Objects keep stable IDs for UI confirmation while preserving the simple
     # category arrays used by older clients.
     return {'well_represented':represented,'weakly_represented':weak,'library_only':library_only,
-            'unsupported':unsupported,'requirements':structured}
+            'unsupported':unsupported,'requirements':structured,
+            'scoring_version':SCORING_VERSION,
+            'score_thresholds':{
+                'well_represented':WELL_REPRESENTED_THRESHOLD,
+                'weakly_represented':WEAKLY_REPRESENTED_THRESHOLD,
+            },
+            'source_fingerprint':source_fingerprint}
 @app.get("/applications/{id}/comparison",response_model=ComparisonOut)
 def comparison(id:int,s:Session=Depends(db)):
     a=s.get(Application,id)
