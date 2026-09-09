@@ -1,6 +1,6 @@
 # Backend Progress
 
-Updated: September 7, 2026
+Updated: September 9, 2026
 
 ## Done
 
@@ -31,25 +31,25 @@ Updated: September 7, 2026
 - [x] Baseline-template contact, education, project, skills, and activity rendering parity
 - [x] Deterministic renderer checks, PDF page-count fallback, and renderer failure diagnostics
 - [x] Checkpoint migration ownership, idempotence, and rollback tests
-- [x] Backend test suite: 37/37 passing
+- [x] Backend test suite: 100/100 passing
 
 ## Remaining
 
-- [ ] Add personal-information records
-- [ ] Add content and bullet version history
+- [x] Add personal-information records
+- [x] Add content and bullet version history
 - [x] Add claim provenance and supporting evidence
 - [x] Add archive restore and duplication
 - [x] Add normalized skill relationships and aliases
-- [ ] Expand application metadata and status history
-- [ ] Add submitted-revision tracking
-- [ ] Add structured job requirements and evidence links
-- [ ] Improve matching classifications and scoring
+- [x] Expand application metadata and status history
+- [x] Add submitted-revision tracking
+- [x] Add structured job requirements and evidence links
+- [x] Improve matching classifications and scoring
 - [x] Turn confirmed missing information into verified source records
 - [x] Add an `LLMProvider` interface
 - [x] Add versioned AI prompts and structured output schemas
 - [x] Generate evidence-grounded optimization proposals
 - [x] Store optimization runs and per-change decisions
-- [ ] Add revision comparison
-- [ ] Add backup and export
+- [x] Add revision comparison
+- [x] Add backup and export
 
 > Editable verified source data feeds future resumes; immutable revisions preserve past resumes.
