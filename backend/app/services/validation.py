@@ -179,13 +179,14 @@ def validate_proposal(proposal: dict[str, Any], snapshot: dict[str, Any]) -> dic
 
     allowed = {
         "schema_version", "selected_entries", "bullet_changes", "warnings",
-        "rationale", "source_fingerprint", "prompt_version",
+        "rationale", "source_fingerprint", "prompt_version", "requirement_ids",
+        "requirement_evidence",
     }
     unknown = sorted(set(proposal) - allowed)
     if unknown:
         raise ValidationError(f"proposal contains unsupported fields: {', '.join(unknown)}")
-    if "schema_version" in proposal and proposal["schema_version"] != "1.0":
-        raise ValidationError("proposal schema_version must be '1.0'")
+    if "schema_version" in proposal and proposal["schema_version"] not in {"1.0", "2.0"}:
+        raise ValidationError("proposal schema_version must be '1.0' or '2.0'")
     if "source_fingerprint" in proposal and not isinstance(proposal["source_fingerprint"], str):
         raise ValidationError("proposal source_fingerprint must be a string")
     if "prompt_version" in proposal and not isinstance(proposal["prompt_version"], str):
@@ -194,6 +195,15 @@ def validate_proposal(proposal: dict[str, Any], snapshot: dict[str, Any]) -> dic
         _validate_string_list(proposal["warnings"], "proposal.warnings")
     if "rationale" in proposal and not isinstance(proposal["rationale"], str):
         raise ValidationError("proposal rationale must be a string")
+    requirement_ids = _validate_id_list(proposal.get("requirement_ids", []), "proposal.requirement_ids")
+    if "requirement_evidence" in proposal:
+        for index, raw_link in enumerate(_require_list(proposal["requirement_evidence"], "proposal.requirement_evidence")):
+            link = _require_object(raw_link, f"proposal.requirement_evidence[{index}]")
+            if "requirement_id" not in link:
+                raise ValidationError(f"proposal.requirement_evidence[{index}] is missing requirement_id")
+            _require_id(link["requirement_id"], f"proposal.requirement_evidence[{index}].requirement_id")
+            if "evidence_ids" in link:
+                _validate_id_list(link["evidence_ids"], f"proposal.requirement_evidence[{index}].evidence_ids")
 
     selected_entries = _require_list(proposal.get("selected_entries", []), "proposal.selected_entries")
     selected_content_ids: set[str] = set()
@@ -236,6 +246,8 @@ def validate_proposal(proposal: dict[str, Any], snapshot: dict[str, Any]) -> dic
             raise ValidationError(f"proposal.bullet_changes[{index}].rationale must be a string")
         if "evidence" in change:
             _validate_string_list(change["evidence"], f"proposal.bullet_changes[{index}].evidence")
+        if "requirement_ids" in change:
+            _validate_id_list(change["requirement_ids"], f"proposal.bullet_changes[{index}].requirement_ids")
         if source.get("is_locked") and proposed_text != source.get("text", ""):
             raise ValidationError(f"locked bullet {source['id']} cannot be rewritten")
         _validate_claims(source, proposed_text)

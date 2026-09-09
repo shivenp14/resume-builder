@@ -11,7 +11,7 @@ import uuid
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, event, func, or_, text, inspect
+from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, CheckConstraint, event, func, or_, text, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from .services.renderer import ResumeRenderer, count_pdf_pages
@@ -114,7 +114,66 @@ class ApplicationStatusHistory(Base):
     def changed_at(self): return self.created_at
 class JobAnalysis(Base):
     __tablename__="job_analyses"
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirements: Mapped[list]=mapped_column(JSON); keywords: Mapped[list]=mapped_column(JSON); technologies: Mapped[list]=mapped_column(JSON); responsibilities: Mapped[list]=mapped_column(JSON); preferred_qualifications: Mapped[list]=mapped_column(JSON); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirements: Mapped[list]=mapped_column(JSON); keywords: Mapped[list]=mapped_column(JSON); technologies: Mapped[list]=mapped_column(JSON); responsibilities: Mapped[list]=mapped_column(JSON); preferred_qualifications: Mapped[list]=mapped_column(JSON); schema_version: Mapped[str]=mapped_column(String(40),default="2.0"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+class JobRequirement(Base):
+    """A durable, application-scoped requirement extracted from a job.
+
+    ``id`` is intentionally the public requirement identifier.  Re-analysis
+    upserts by ``normalized_key`` so unchanged requirements retain the same
+    id, even though each ``JobAnalysis`` row is an immutable audit record.
+    """
+    __tablename__="job_requirements"
+    __table_args__=(UniqueConstraint("application_id", "normalized_key", name="uq_job_requirement_key"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    application_id: Mapped[int]=mapped_column(ForeignKey("applications.id",ondelete="CASCADE"),index=True)
+    normalized_key: Mapped[str]=mapped_column(String(240))
+    text: Mapped[str]=mapped_column(Text)
+    category: Mapped[str]=mapped_column(String(40),default="required")
+    priority: Mapped[str]=mapped_column(String(30),default="required")
+    source_text: Mapped[str|None]=mapped_column(Text,nullable=True)
+    is_active: Mapped[bool]=mapped_column(Boolean,default=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
+    evidence_links: Mapped[list["RequirementEvidenceLink"]]=relationship(cascade="all, delete-orphan")
+
+    # These aliases make the typed model pleasant for callers that use the
+    # vocabulary from the API contract rather than the storage column names.
+    @property
+    def requirement_id(self): return self.id
+    @property
+    def kind(self): return self.category
+    @property
+    def description(self): return self.text
+    @property
+    def stable_id(self): return self.normalized_key
+    @property
+    def requirement_type(self): return self.category
+    @property
+    def importance(self): return self.priority
+
+class RequirementEvidenceLink(Base):
+    """A validated link from one requirement to verified source evidence."""
+    __tablename__="requirement_evidence_links"
+    __table_args__=(UniqueConstraint("requirement_id", "content_item_id", "bullet_id", "skill_id", name="uq_requirement_evidence_source"),
+                    CheckConstraint("content_item_id IS NOT NULL OR bullet_id IS NOT NULL OR skill_id IS NOT NULL", name="ck_requirement_evidence_has_source"),
+                    CheckConstraint("source_type IN ('bullet', 'content_item', 'skill')", name="ck_requirement_evidence_source_type"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    requirement_id: Mapped[int]=mapped_column(ForeignKey("job_requirements.id",ondelete="CASCADE"),index=True)
+    content_item_id: Mapped[int|None]=mapped_column(ForeignKey("content_items.id",ondelete="CASCADE"),nullable=True,index=True)
+    bullet_id: Mapped[int|None]=mapped_column(ForeignKey("bullets.id",ondelete="CASCADE"),nullable=True,index=True)
+    skill_id: Mapped[int|None]=mapped_column(ForeignKey("skills.id",ondelete="CASCADE"),nullable=True,index=True)
+    source_type: Mapped[str]=mapped_column(String(30),default="bullet")
+    excerpt: Mapped[str|None]=mapped_column(Text,nullable=True)
+    note: Mapped[str|None]=mapped_column(Text,nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    @property
+    def source_id(self): return self.bullet_id or self.content_item_id or self.skill_id
+
+# Public aliases retain intuitive names for integrations and older prototypes.
+JobRequirementEvidence = RequirementEvidenceLink
+EvidenceLink = RequirementEvidenceLink
+RequirementEvidence = RequirementEvidenceLink
+JobRequirementLink = RequirementEvidenceLink
 class Proposal(Base):
     __tablename__="proposals"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); payload: Mapped[dict]=mapped_column(JSON); status: Mapped[str]=mapped_column(String(20),default="pending"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
@@ -124,7 +183,7 @@ class Revision(Base):
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); revision_number: Mapped[int]; resume_json: Mapped[dict]=mapped_column(JSON); latex_path: Mapped[str|None]=mapped_column(String(500)); pdf_path: Mapped[str|None]=mapped_column(String(500)); page_count: Mapped[int|None]; status: Mapped[str]=mapped_column(String(20),default="draft"); generated_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 class MissingConfirmation(Base):
     __tablename__="missing_confirmations"
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirement: Mapped[str]=mapped_column(Text); status: Mapped[str]=mapped_column(String(20),default="unresolved"); context: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirement: Mapped[str]=mapped_column(Text); requirement_id: Mapped[int|None]=mapped_column(ForeignKey("job_requirements.id",ondelete="SET NULL"),nullable=True,index=True); status: Mapped[str]=mapped_column(String(20),default="unresolved"); context: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 class OptimizationRun(Base):
     __tablename__="optimization_runs"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); operation: Mapped[str]=mapped_column(String(40)); status: Mapped[str]=mapped_column(String(20),default="running"); model: Mapped[str]=mapped_column(String(100),default="gpt-5.6-luna"); reasoning_effort: Mapped[str]=mapped_column(String(20),default="low"); prompt_version: Mapped[str]=mapped_column(String(40),default="v1"); schema_version: Mapped[str]=mapped_column(String(40),default="v1"); idempotency_key: Mapped[str|None]=mapped_column(String(200)); input_payload: Mapped[dict]=mapped_column(JSON,default=dict); output_payload: Mapped[dict|None]=mapped_column(JSON); error: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
@@ -220,6 +279,180 @@ def _personal_contact(personal: PersonalInformation|None, legacy: Any = None) ->
     if personal is None and isinstance(legacy,dict) and legacy.get("linkedin_label"):
         result["linkedin_label"]=legacy["linkedin_label"]
     return result
+
+def _normalize_requirement_key(value: Any) -> str:
+    """Return a deterministic, whitespace/case-insensitive requirement key."""
+    text_value = re.sub(r"\s+", " ", str(value or "").strip().casefold())
+    return re.sub(r"[^\w\s+.#-]", "", text_value).strip()
+
+def _requirement_payload(raw: Any, *, category: str = "required", source_text: str|None = None) -> dict[str,Any] | None:
+    """Normalize v1 string output and v2 structured output to one shape."""
+    if isinstance(raw, str):
+        text_value = raw.strip()
+        raw_value: dict[str,Any] = {}
+    elif isinstance(raw, dict):
+        raw_value = raw
+        text_value = str(raw.get("text") or raw.get("requirement") or raw.get("description") or "").strip()
+    else:
+        return None
+    if not text_value:
+        return None
+    item_category = str(raw_value.get("category") or raw_value.get("kind") or category).strip().casefold()
+    if item_category not in {"required", "preferred", "responsibility", "technology", "keyword", "other"}:
+        item_category = category if category in {"required", "preferred", "responsibility", "technology", "keyword", "other"} else "other"
+    priority = str(raw_value.get("priority") or raw_value.get("importance") or ("preferred" if item_category == "preferred" else "required")).strip().casefold()
+    if priority not in {"required", "preferred", "nice_to_have", "unknown"}:
+        priority = "unknown"
+    return {
+        "text": text_value,
+        "category": item_category,
+        "priority": priority,
+        "source_text": source_text or raw_value.get("source_text") or text_value,
+        "normalized_key": _normalize_requirement_key(text_value),
+    }
+
+def _requirement_response(requirement: JobRequirement, s: Session, *, include_evidence: bool = True) -> dict[str,Any]:
+    links = []
+    if include_evidence:
+        for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=requirement.id).order_by(RequirementEvidenceLink.id).all():
+            links.append(_evidence_response(link, s))
+    return {
+        "id": requirement.id,
+        "requirement_id": requirement.id,
+        "key": requirement.normalized_key,
+        "requirement_key": requirement.normalized_key,
+        "stable_id": requirement.normalized_key,
+        "text": requirement.text,
+        "requirement": requirement.text,
+        "category": requirement.category,
+        "kind": requirement.category,
+        "requirement_type": requirement.category,
+        "priority": requirement.priority,
+        "importance": requirement.priority,
+        "source_text": requirement.source_text,
+        "is_active": bool(requirement.is_active),
+        "evidence_links": links,
+        "evidence": links,
+        "created_at": requirement.created_at,
+        "updated_at": requirement.updated_at,
+    }
+
+def _evidence_response(link: RequirementEvidenceLink, s: Session) -> dict[str,Any]:
+    """Serialize a link with stable source identifiers and human context."""
+    result = {
+        "id": link.id,
+        "requirement_id": link.requirement_id,
+        "source_type": link.source_type,
+        "content_item_id": link.content_item_id,
+        "bullet_id": link.bullet_id,
+        "skill_id": link.skill_id,
+        "source_id": link.source_id,
+        "excerpt": link.excerpt,
+        "note": link.note,
+        "created_at": link.created_at,
+    }
+    if link.bullet_id is not None:
+        bullet = s.get(Bullet, link.bullet_id)
+        if bullet:
+            result["source"] = {"type": "bullet", "id": bullet.id, "text": bullet.text, "content_item_id": bullet.content_item_id}
+    elif link.content_item_id is not None:
+        item = s.get(ContentItem, link.content_item_id)
+        if item:
+            result["source"] = {"type": "content_item", "id": item.id, "title": item.title}
+    elif link.skill_id is not None:
+        skill = s.get(Skill, link.skill_id)
+        if skill:
+            result["source"] = {"type": "skill", "id": skill.id, "name": skill.name}
+    return result
+
+def _upsert_requirement(s: Session, application_id: int, payload: dict[str,Any]) -> JobRequirement:
+    """Create/update a requirement without changing its durable integer id."""
+    key = payload["normalized_key"]
+    requirement = s.query(JobRequirement).filter_by(application_id=application_id, normalized_key=key).first()
+    if requirement is None:
+        requirement = JobRequirement(application_id=application_id, normalized_key=key)
+        s.add(requirement)
+    requirement.text = payload["text"]
+    requirement.category = payload["category"]
+    requirement.priority = payload["priority"]
+    requirement.source_text = payload.get("source_text")
+    requirement.is_active = True
+    s.flush()
+    return requirement
+
+def _analysis_requirement_rows(analysis: JobAnalysis, s: Session) -> list[JobRequirement]:
+    """Return durable rows for an analysis, backfilling an old row if needed."""
+    rows: list[JobRequirement] = []
+    values = analysis.requirements if isinstance(analysis.requirements, list) else []
+    for raw in values:
+        payload = _requirement_payload(raw)
+        if payload is None:
+            continue
+        requirement = _upsert_requirement(s, analysis.application_id, payload)
+        rows.append(requirement)
+    # A legacy analysis may have no structured ``requirements`` but still has
+    # technology output.  Those technologies are useful stable requirements
+    # for comparison and confirmation routes.
+    existing_keys = {row.normalized_key for row in rows}
+    for technology in analysis.technologies or []:
+        payload = _requirement_payload(technology, category="technology")
+        if payload and payload["normalized_key"] not in existing_keys:
+            rows.append(_upsert_requirement(s, analysis.application_id, payload))
+            existing_keys.add(payload["normalized_key"])
+    return rows
+
+def _analysis_response(analysis: JobAnalysis, s: Session) -> dict[str,Any]:
+    rows = _analysis_requirement_rows(analysis, s)
+    return {
+        "id": analysis.id,
+        "application_id": analysis.application_id,
+        "schema_version": analysis.schema_version or "1.0",
+        "requirements": [_requirement_response(row, s) for row in rows],
+        "requirement_texts": [row.text for row in rows],
+        "keywords": list(analysis.keywords or []),
+        "technologies": list(analysis.technologies or []),
+        "responsibilities": list(analysis.responsibilities or []),
+        "preferred_qualifications": list(analysis.preferred_qualifications or []),
+        "created_at": analysis.created_at,
+    }
+
+def _requirement_mentions_skill(text_value: str, skill: Skill, s: Session) -> bool:
+    """Match a requirement to a canonical skill or alias without fuzzy scoring."""
+    haystack = re.sub(r"[^a-z0-9+#]+", " ", text_value.casefold())
+    candidates = [skill.name, *_skill_alias_values(skill, s)]
+    for candidate in candidates:
+        needle = re.sub(r"[^a-z0-9+#]+", " ", candidate.casefold()).strip()
+        if needle and re.search(r"(?:^|\s)" + re.escape(needle) + r"(?:$|\s)", haystack):
+            return True
+    return False
+
+def _sync_requirement_skill_evidence(s: Session, requirements: list[JobRequirement], application_id: int) -> None:
+    """Create idempotent skill evidence links from verified source relations."""
+    if not requirements:
+        return
+    skill_rows = s.query(Skill).filter_by(verified=True).order_by(Skill.id).all()
+    if not s.get(Application, application_id):
+        return
+    for requirement in requirements:
+        for skill in skill_rows:
+            if not _requirement_mentions_skill(requirement.text, skill, s):
+                continue
+            relationships = s.query(ContentItemSkill).filter_by(skill_id=skill.id).order_by(ContentItemSkill.id).all()
+            for relationship in relationships:
+                exists = s.query(RequirementEvidenceLink.id).filter_by(
+                    requirement_id=requirement.id,
+                    content_item_id=relationship.content_item_id,
+                    bullet_id=None,
+                    skill_id=skill.id,
+                ).first()
+                if exists is None:
+                    s.add(RequirementEvidenceLink(
+                        requirement_id=requirement.id,
+                        content_item_id=relationship.content_item_id,
+                        skill_id=skill.id,
+                        source_type="skill",
+                        note="normalized verified skill relationship",
+                    ))
 
 def _backfill_legacy_contacts(session: Session) -> int:
     """Create/link one typed record for each legacy contact exactly once."""
@@ -456,6 +689,16 @@ def _apply_sqlite_integrity_migrations() -> None:
         revision_columns = {column["name"] for column in inspect(connection).get_columns("revisions")}
         if "generated_at" not in revision_columns:
             connection.execute(text("ALTER TABLE revisions ADD COLUMN generated_at DATETIME"))
+        analysis_columns = {column["name"] for column in inspect(connection).get_columns("job_analyses")}
+        if "schema_version" not in analysis_columns:
+            connection.execute(text("ALTER TABLE job_analyses ADD COLUMN schema_version VARCHAR(40) DEFAULT '1.0'"))
+        confirmation_columns = {column["name"] for column in inspect(connection).get_columns("missing_confirmations")}
+        if "requirement_id" not in confirmation_columns:
+            connection.execute(text("ALTER TABLE missing_confirmations ADD COLUMN requirement_id INTEGER"))
+        # New durable requirement/evidence tables are additive and can be
+        # created safely while an older process still reads legacy JSON.
+        JobRequirement.__table__.create(connection, checkfirst=True)
+        RequirementEvidenceLink.__table__.create(connection, checkfirst=True)
         # A legacy SQLite table cannot gain a foreign key via ADD COLUMN.  A
         # table rebuild would risk user data, so install equivalent ownership
         # guards instead.  Invalid legacy pointers are cleared before the
@@ -493,6 +736,9 @@ def _apply_sqlite_integrity_migrations() -> None:
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_bullet_version_number_idx ON bullet_versions (bullet_id, version_number)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_base_resumes_personal_information_id ON base_resumes (personal_information_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_application_status_history_application_id ON application_status_history (application_id, created_at)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_job_requirements_application_id ON job_requirements (application_id, id)"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_job_requirement_key_idx ON job_requirements (application_id, normalized_key)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_requirement_evidence_links_requirement_id ON requirement_evidence_links (requirement_id, id)"))
         connection.execute(text("""
             CREATE TRIGGER IF NOT EXISTS applications_submitted_revision_insert_guard
             BEFORE INSERT ON applications
@@ -565,6 +811,30 @@ def _apply_sqlite_integrity_migrations() -> None:
                         source="tag-migration",
                     ))
         _backfill_legacy_contacts(session)
+        # Backfill normalized requirement rows from legacy JSON analyses.  The
+        # normalized key and unique index make this safe across repeated
+        # startups and preserve the same integer id on re-analysis.
+        for analysis in session.query(JobAnalysis).order_by(JobAnalysis.id).all():
+            rows = _analysis_requirement_rows(analysis, session)
+            _sync_requirement_skill_evidence(session, rows, analysis.application_id)
+            if rows:
+                analysis.requirements = [
+                    {"id": row.id, "requirement_id": row.id, "key": row.normalized_key,
+                     "text": row.text, "category": row.category, "priority": row.priority,
+                     "source_text": row.source_text}
+                    for row in rows
+                ]
+            if not analysis.schema_version:
+                analysis.schema_version = "1.0"
+        # Existing text-keyed confirmation rows are linked only on an exact
+        # normalized match.  Ambiguous or unmatched legacy rows remain intact.
+        for confirmation in session.query(MissingConfirmation).filter(MissingConfirmation.requirement_id.is_(None)).all():
+            key = _normalize_requirement_key(confirmation.requirement)
+            candidates = session.query(JobRequirement).filter_by(
+                application_id=confirmation.application_id, normalized_key=key
+            ).all()
+            if len(candidates) == 1:
+                confirmation.requirement_id = candidates[0].id
         for item in session.query(ContentItem).all():
             if not session.query(ContentItemVersion.id).filter_by(content_item_id=item.id).first():
                 _append_content_version(session,item,action="backfill",changed_fields=list(_CONTENT_VERSION_FIELDS))
@@ -671,11 +941,21 @@ class StatusChangeIn(BaseModel):
 class SubmitRevisionIn(BaseModel):
     revision_id:int
     submitted_at:datetime|None=None
+class EvidenceLinkIn(BaseModel):
+    """A link to one or more concrete, verified source records."""
+    source_type:str|None=None
+    content_item_id:int|None=None
+    bullet_id:int|None=None
+    skill_id:int|None=None
+    excerpt:str|None=None
+    note:str|None=None
+
 class ProposalIn(BaseModel): payload:dict[str,Any]
 class RevisionIn(BaseModel): resume_json:dict[str,Any]
-class ConfirmationIn(BaseModel): status:str; context:dict[str,Any]=Field(default_factory=dict)
+class ConfirmationIn(BaseModel): status:str; context:dict[str,Any]=Field(default_factory=dict); requirement_id:int|None=None
 class ConfirmationDecisionIn(BaseModel):
-    requirement: str = Field(min_length=1, max_length=1000)
+    requirement: str|None = Field(default=None, min_length=1, max_length=1000)
+    requirement_id: int|None=None
     decision: str|None=None
     status: str|None=None
     context: dict[str,Any]=Field(default_factory=dict)
@@ -705,7 +985,11 @@ class ApplicationOut(APIOut):
 class StatusHistoryOut(APIOut):
     id:int; application_id:int; from_status:str|None; to_status:str; status:str; reason:str|None; created_at:datetime; changed_at:datetime
 class JobAnalysisOut(APIOut):
-    id:int; application_id:int; requirements:list[str]; keywords:list[str]; technologies:list[str]; responsibilities:list[str]; preferred_qualifications:list[str]; created_at:datetime
+    id:int; application_id:int; schema_version:str="2.0"; requirements:list[dict[str,Any]]; requirement_texts:list[str]=Field(default_factory=list); keywords:list[str]; technologies:list[str]; responsibilities:list[str]; preferred_qualifications:list[str]; created_at:datetime
+class EvidenceLinkOut(APIOut):
+    id:int; requirement_id:int; source_type:str; source_id:int|None=None; content_item_id:int|None; bullet_id:int|None; skill_id:int|None; excerpt:str|None; note:str|None; source:dict[str,Any]|None=None; created_at:datetime
+class JobRequirementOut(APIOut):
+    id:int; requirement_id:int; key:str; requirement_key:str; stable_id:str; text:str; requirement:str; category:str; kind:str; requirement_type:str; priority:str; importance:str; source_text:str|None; is_active:bool; evidence_links:list[EvidenceLinkOut]=Field(default_factory=list); evidence:list[EvidenceLinkOut]=Field(default_factory=list); created_at:datetime; updated_at:datetime
 class ProposalOut(APIOut): id:int; application_id:int; payload:dict[str,Any]; status:str; created_at:datetime
 class RevisionOut(APIOut):
     id:int; application_id:int; revision_number:int; resume_json:dict[str,Any]; latex_path:str|None; pdf_path:str|None; page_count:int|None; status:str; generated_at:datetime|None; created_at:datetime
@@ -719,7 +1003,7 @@ class RevisionComparisonOut(APIOut):
     application_id:int; from_revision:RevisionReferenceOut; to_revision:RevisionReferenceOut
     changed:bool; summary:RevisionDiffSummaryOut
     added:list[RevisionDiffChangeOut]; removed:list[RevisionDiffChangeOut]; modified:list[RevisionDiffChangeOut]; changed_items:list[RevisionDiffChangeOut]; changes:list[RevisionDiffChangeOut]
-class ConfirmationOut(APIOut): id:int; application_id:int; requirement:str; status:str; context:dict[str,Any]; created_at:datetime
+class ConfirmationOut(APIOut): id:int; application_id:int; requirement:str; requirement_id:int|None=None; status:str; context:dict[str,Any]; created_at:datetime
 class OptimizationRunOut(APIOut):
     id:int; application_id:int; operation:str; status:str; model:str; reasoning_effort:str; prompt_version:str; schema_version:str; idempotency_key:str|None; input_payload:dict[str,Any]; output_payload:dict[str,Any]|None; error:str|None; created_at:datetime; completed_at:datetime|None
 class ContentItemVersionOut(APIOut):
@@ -727,7 +1011,7 @@ class ContentItemVersionOut(APIOut):
 class BulletVersionOut(APIOut):
     id:int; bullet_id:int; content_item_id:int; version_number:int; version:int; action:str; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool; changed_fields:list[str]; snapshot:dict[str,Any]; created_at:datetime
 class ComparisonOut(APIOut):
-    well_represented:list[str]; weakly_represented:list[str]; library_only:list[str]; unsupported:list[dict[str,str]]
+    well_represented:list[str]; weakly_represented:list[str]; library_only:list[str]; unsupported:list[dict[str,Any]]; requirements:list[dict[str,Any]]=Field(default_factory=list)
 class SnapshotOut(APIOut):
     contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; provenance:dict[str,Any]|None=None
 class GenerationOut(RevisionOut): proposal_id:int; latex_url:str; pdf_url:str
@@ -1432,14 +1716,45 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
         "personal_information_id":base.personal_information_id,"contact":canonical_contact},
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
+    analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
+    requirement_rows=_analysis_requirement_rows(analysis,s) if analysis else []
+    source["requirements"]= [{
+        "id": row.id, "requirement_id": row.id, "key": row.normalized_key,
+        "requirement_key": row.normalized_key, "stable_id": row.normalized_key, "text": row.text, "category": row.category,
+        "requirement_type": row.category, "priority": row.priority,
+        "evidence_ids": [link.id for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=row.id).order_by(RequirementEvidenceLink.id).all()],
+    } for row in requirement_rows]
+    source["requirement_evidence_ids"] = [
+        link.id for row in requirement_rows
+        for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=row.id).order_by(RequirementEvidenceLink.id).all()
+    ]
     fingerprint=hashlib.sha256(json.dumps(source,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
     base_snapshot=build_snapshot(a,s); base_snapshot.pop("contact",None)
-    return {"base_snapshot":base_snapshot,"verified_library":verified,"source_fingerprint":fingerprint}
+    return {"base_snapshot":base_snapshot,"verified_library":verified,
+        "requirements":source["requirements"],
+        "requirement_evidence_ids":source["requirement_evidence_ids"],
+        "source_fingerprint":fingerprint}
 
 def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fresh:bool=True) -> dict[str,Any]:
     context=_verified_context(a,s)
     grounding={**context["verified_library"],"entries":[]}
     validate_proposal(payload,grounding)
+    requirements={str(row["id"]):row for row in context.get("requirements",[])}
+    evidence_ids={str(evidence_id) for evidence_id in context.get("requirement_evidence_ids",[])}
+    for raw_id in payload.get("requirement_ids",[]):
+        if str(raw_id) not in requirements:
+            raise ValidationError("proposal references unknown requirement")
+    for index, raw_change in enumerate(payload.get("bullet_changes",[])):
+        for raw_id in raw_change.get("requirement_ids",[]):
+            if str(raw_id) not in requirements:
+                raise ValidationError(f"proposal.bullet_changes[{index}] references unknown requirement")
+    for index, raw_link in enumerate(payload.get("requirement_evidence",[])):
+        raw_id=str(raw_link.get("requirement_id"))
+        if raw_id not in requirements:
+            raise ValidationError(f"proposal.requirement_evidence[{index}] references unknown requirement")
+        for evidence_id in raw_link.get("evidence_ids",[]):
+            if str(evidence_id) not in evidence_ids:
+                raise ValidationError(f"proposal.requirement_evidence[{index}] references unknown evidence link")
     owned:dict[int,set[int]]={item["id"]:set() for item in grounding["content_items"]}
     base_item_ids={entry["content_item_id"] for entry in context["base_snapshot"]["entries"]}
     for bullet in grounding["bullets"]: owned[bullet["content_item_id"]].add(bullet["id"])
@@ -1472,22 +1787,59 @@ def analyze(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)
         prior=s.query(OptimizationRun).filter_by(application_id=id,operation="analysis",idempotency_key=key).first()
         if prior and prior.status=="succeeded" and prior.output_payload:
             existing=s.get(JobAnalysis,prior.output_payload.get("id"))
-            if existing: return existing
+            if existing: return _analysis_response(existing,s)
     run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,input_payload={"job_description":a.job_description},model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
     try:
         result=_provider_call(_provider(),"analysis",a.job_description)
         if hasattr(result,"model_dump"): result=result.model_dump()
         if not isinstance(result,dict): raise ValueError("Codex returned invalid analysis")
         fields={k:list(result.get(k,[])) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")}
-        o=JobAnalysis(application_id=id,**fields); s.add(o); s.flush()
-        run.status="succeeded"; run.output_payload={"id":o.id,**fields}; run.completed_at=now(); s.commit(); s.refresh(o); return o
+        # Normalize both legacy v1 string output and v2 requirement objects;
+        # categories for preferred/responsibility fields are retained in the
+        # durable requirement table rather than inferred later by clients.
+        normalized_requirements=[]
+        for raw in fields["requirements"]:
+            payload=_requirement_payload(raw)
+            if payload: normalized_requirements.append(payload)
+        for raw in fields["preferred_qualifications"]:
+            payload=_requirement_payload(raw,category="preferred")
+            if payload: normalized_requirements.append(payload)
+        for raw in fields["responsibilities"]:
+            payload=_requirement_payload(raw,category="responsibility")
+            if payload: normalized_requirements.append(payload)
+        # Technologies are first-class requirements when the provider did not
+        # already include them in the structured list. This preserves the
+        # legacy comparison behavior while giving each term a stable id.
+        seen_keys={item["normalized_key"] for item in normalized_requirements}
+        for raw in fields["technologies"]:
+            payload=_requirement_payload(raw,category="technology")
+            if payload and payload["normalized_key"] not in seen_keys:
+                normalized_requirements.append(payload); seen_keys.add(payload["normalized_key"])
+        o=JobAnalysis(application_id=id,requirements=normalized_requirements,
+            keywords=fields["keywords"],technologies=fields["technologies"],
+            responsibilities=fields["responsibilities"],preferred_qualifications=fields["preferred_qualifications"],
+            schema_version=SCHEMA_VERSION); s.add(o); s.flush()
+        s.query(JobRequirement).filter_by(application_id=id).update({"is_active":False}, synchronize_session=False)
+        rows=[]
+        for payload in normalized_requirements:
+            row=_upsert_requirement(s,id,payload); rows.append(row)
+        o.requirements=[{"id":row.id,"requirement_id":row.id,"key":row.normalized_key,
+            "text":row.text,"category":row.category,"priority":row.priority,
+            "source_text":row.source_text} for row in rows]
+        # A normalized skill relationship is verified source evidence. Link
+        # exact skill/alias mentions automatically, without inventing bullets
+        # or promoting unverified skills.
+        _sync_requirement_skill_evidence(s, rows, id)
+        run.status="succeeded"; run.output_payload={"id":o.id,**fields,
+            "requirements":[{"id":row.id,"text":row.text,"category":row.category} for row in rows]}; run.completed_at=now(); s.commit(); s.refresh(o); return _analysis_response(o,s)
     except Exception as exc:
         run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); s.commit(); raise HTTPException(503,"Codex provider unavailable: "+run.error)
 @app.get("/applications/{id}/analysis",response_model=JobAnalysisOut)
 def get_analysis(id:int,s:Session=Depends(db)):
+    if not s.get(Application,id): raise HTTPException(404,"application not found")
     o=s.query(JobAnalysis).filter_by(application_id=id).order_by(JobAnalysis.created_at.desc()).first()
     if not o: raise HTTPException(404,"analysis not found")
-    return o
+    return _analysis_response(o,s)
 @app.post("/applications/{id}/proposals/generate",response_model=ProposalOut)
 def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)):
     a=s.get(Application,id)
@@ -1502,7 +1854,8 @@ def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=
             if existing: return existing
     context=_verified_context(a,s)
     payload={"analysis":{k:getattr(analysis,k) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")},
-        **context,"confirmations":[{"requirement":x.requirement,"status":x.status,"context":x.context}
+        "analysis_schema_version":analysis.schema_version or "1.0",
+        **context,"confirmations":[{"requirement_id":x.requirement_id,"requirement":x.requirement,"status":x.status,"context":x.context}
         for x in s.query(MissingConfirmation).filter_by(application_id=id)]}
     run=OptimizationRun(application_id=id,operation="proposal",idempotency_key=key,input_payload=payload,model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
     try:
@@ -1510,7 +1863,7 @@ def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=
         if hasattr(out,"model_dump"): out=out.model_dump()
         if not isinstance(out,dict): raise ValueError("Codex returned invalid proposal")
         out={**out,"source_fingerprint":context["source_fingerprint"],"prompt_version":PROMPT_VERSION,
-            "schema_version":out.get("schema_version",SCHEMA_VERSION)}
+            "schema_version":SCHEMA_VERSION}
         _validate_proposal_payload(a,out,s)
         # Reuse the existing proposal validation gates before persistence.
         p=Proposal(application_id=id,payload=out); s.add(p); s.flush()
@@ -1530,10 +1883,112 @@ def optimization_run(id:int,s:Session=Depends(db)):
     o=s.get(OptimizationRun,id)
     if not o: raise HTTPException(404,"optimization run not found")
     return o
+
+def _application_requirement(application_id:int, requirement_id:int, s:Session) -> JobRequirement:
+    requirement=s.get(JobRequirement,requirement_id)
+    if requirement is None or requirement.application_id != application_id:
+        raise HTTPException(404,"requirement not found")
+    return requirement
+
+def _validated_evidence_link(application_id:int, requirement_id:int, x:EvidenceLinkIn, s:Session) -> RequirementEvidenceLink:
+    _application_requirement(application_id,requirement_id,s)
+    values=x.model_dump(exclude_none=True)
+    content_item_id=values.get("content_item_id")
+    bullet_id=values.get("bullet_id")
+    skill_id=values.get("skill_id")
+    if content_item_id is None and bullet_id is None and skill_id is None:
+        raise HTTPException(422,"evidence link requires content_item_id, bullet_id, or skill_id")
+    if content_item_id is not None and not s.get(ContentItem,content_item_id):
+        raise HTTPException(404,"evidence content item not found")
+    bullet=s.get(Bullet,bullet_id) if bullet_id is not None else None
+    if bullet_id is not None and bullet is None:
+        raise HTTPException(404,"evidence bullet not found")
+    if bullet is not None:
+        if content_item_id is not None and bullet.content_item_id != content_item_id:
+            raise HTTPException(422,"evidence bullet does not belong to content item")
+        content_item_id=bullet.content_item_id
+    skill=s.get(Skill,skill_id) if skill_id is not None else None
+    if skill_id is not None and skill is None:
+        raise HTTPException(404,"evidence skill not found")
+    if skill is not None and not skill.verified:
+        raise HTTPException(422,"evidence skill must be verified")
+    source_type=values.get("source_type")
+    inferred="bullet" if bullet_id is not None else ("skill" if skill_id is not None else "content_item")
+    if source_type is not None and source_type not in {"bullet","content_item","skill"}:
+        raise HTTPException(422,"source_type must be bullet, content_item, or skill")
+    if source_type is not None and source_type != inferred:
+        raise HTTPException(422,"source_type does not match evidence source")
+    # A normalized skill attached to a content item is evidence only when the
+    # relationship itself exists; this prevents arbitrary skill claims.
+    if skill is not None and content_item_id is not None and not s.query(ContentItemSkill.id).filter_by(
+        content_item_id=content_item_id, skill_id=skill.id
+    ).first():
+        raise HTTPException(422,"evidence skill is not linked to content item")
+    duplicate=s.query(RequirementEvidenceLink).filter_by(
+        requirement_id=requirement_id,content_item_id=content_item_id,
+        bullet_id=bullet_id,skill_id=skill_id,
+    ).first()
+    if duplicate is not None:
+        raise HTTPException(409,"evidence link already exists")
+    return RequirementEvidenceLink(
+        requirement_id=requirement_id,content_item_id=content_item_id,
+        bullet_id=bullet_id,skill_id=skill_id,source_type=inferred,
+        excerpt=values.get("excerpt"),note=values.get("note"),
+    )
+
+@app.get("/applications/{id}/requirements",response_model=list[JobRequirementOut])
+def application_requirements(id:int,s:Session=Depends(db)):
+    if not s.get(Application,id): raise HTTPException(404,"application not found")
+    rows=s.query(JobRequirement).filter_by(application_id=id,is_active=True).order_by(JobRequirement.id).all()
+    return [_requirement_response(row,s) for row in rows]
+
+@app.get("/applications/{id}/requirements/{requirement_id}",response_model=JobRequirementOut)
+def application_requirement(id:int,requirement_id:int,s:Session=Depends(db)):
+    return _requirement_response(_application_requirement(id,requirement_id,s),s)
+
+@app.get("/requirements/{requirement_id}",response_model=JobRequirementOut)
+def requirement(requirement_id:int,s:Session=Depends(db)):
+    row=s.get(JobRequirement,requirement_id)
+    if row is None: raise HTTPException(404,"requirement not found")
+    return _requirement_response(row,s)
+
+@app.post("/applications/{id}/requirements/{requirement_id}/evidence",response_model=EvidenceLinkOut)
+def add_requirement_evidence(id:int,requirement_id:int,x:EvidenceLinkIn,s:Session=Depends(db)):
+    if not s.get(Application,id): raise HTTPException(404,"application not found")
+    link=_validated_evidence_link(id,requirement_id,x,s)
+    s.add(link); s.commit(); s.refresh(link)
+    return _evidence_response(link,s)
+
+@app.get("/applications/{id}/requirements/{requirement_id}/evidence",response_model=list[EvidenceLinkOut])
+def requirement_evidence(id:int,requirement_id:int,s:Session=Depends(db)):
+    _application_requirement(id,requirement_id,s)
+    return [_evidence_response(link,s) for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=requirement_id).order_by(RequirementEvidenceLink.id).all()]
+
+@app.delete("/requirement-evidence/{link_id}",response_model=MutationOut)
+def delete_requirement_evidence(link_id:int,s:Session=Depends(db)):
+    link=s.get(RequirementEvidenceLink,link_id)
+    if link is None: raise HTTPException(404,"evidence link not found")
+    s.delete(link); s.commit(); return {"deleted":True}
+
 def _comparison(a:Application,s:Session):
     analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
     if not analysis: raise HTTPException(404,"analyze application first")
-    terms=list(dict.fromkeys([*analysis.technologies,*analysis.keywords]))
+    rows=_analysis_requirement_rows(analysis,s)
+    # Technology terms retain the concise legacy comparison display (for
+    # example ``docker``), while prose requirements remain structured rows.
+    technology_rows=[row for row in rows if row.category == "technology"]
+    prose_rows=[row for row in rows if row.category != "technology"]
+    selected_rows=[]; seen_rows=set()
+    for row in [*technology_rows,*prose_rows]:
+        if row.id not in seen_rows:
+            selected_rows.append(row); seen_rows.add(row.id)
+    if not selected_rows:
+        for term in list(dict.fromkeys([*analysis.technologies,*analysis.keywords])):
+            payload=_requirement_payload(term,category="keyword")
+            if payload:
+                row=_upsert_requirement(s,a.id,payload)
+                if row.id not in seen_rows:
+                    selected_rows.append(row); seen_rows.add(row.id)
     base_ids={e.content_item_id for e in s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id)}
     item_query=s.query(ContentItem)
     if base_ids:
@@ -1543,24 +1998,38 @@ def _comparison(a:Application,s:Session):
     all_items=item_query.all()
     item_skill_links=_item_skill_links([item.id for item in all_items],s)
     skill_index=_skill_name_index(s)
-    represented=[]; weak=[]; library_only=[]; unsupported=[]
-    for term in terms:
-        try:
-            matching_skill_ids=skill_index.get(normalize_skill_name(term),set())
-        except SkillNormalizationError:
-            matching_skill_ids=set()
+    represented=[]; weak=[]; library_only=[]; unsupported=[]; structured=[]
+    for requirement in selected_rows:
+        term=requirement.text
+        matching_skill_ids=set()
+        candidates=[term,*re.findall(r"[A-Za-z][A-Za-z0-9+#.-]*",term)]
+        for candidate in candidates:
+            try:
+                matching_skill_ids.update(skill_index.get(normalize_skill_name(candidate),set()))
+            except SkillNormalizationError:
+                continue
         hits=[i for i in all_items if (
             any(link.skill_id in matching_skill_ids for link in item_skill_links.get(i.id,[]))
-            or term.lower() in ((i.title or '')+' '+(i.summary or '')).lower()
-            or any(term.lower() in b.text.lower() for b in i.bullets)
+            or term.casefold() in ((i.title or '')+' '+(i.summary or '')).casefold()
+            or any(term.casefold() in b.text.casefold() for b in i.bullets)
         )]
-        if not hits: unsupported.append(term)
-        elif any(i.id in base_ids for i in hits): represented.append(term)
-        else: library_only.append(term)
-    # Objects keep a stable field for UI confirmation while preserving the
-    # simple category arrays used by older clients.
+        link_rows=s.query(RequirementEvidenceLink).filter_by(requirement_id=requirement.id).order_by(RequirementEvidenceLink.id).all()
+        evidence_payload=[_evidence_response(link,s) for link in link_rows]
+        if not hits and evidence_payload:
+            evidence_item_ids={link.content_item_id for link in link_rows if link.content_item_id is not None}
+            hits=[item for item in all_items if item.id in evidence_item_ids]
+        if not hits:
+            status="unsupported"
+            unsupported.append({"requirement_id":requirement.id,"requirement_key":requirement.normalized_key,"requirement":term,"status":"unresolved","evidence_links":evidence_payload})
+        elif any(i.id in base_ids for i in hits):
+            status="represented"; represented.append(term)
+        else:
+            status="library_only"; library_only.append(term)
+        structured.append({**_requirement_response(requirement,s),"status":status})
+    # Objects keep stable IDs for UI confirmation while preserving the simple
+    # category arrays used by older clients.
     return {'well_represented':represented,'weakly_represented':weak,'library_only':library_only,
-            'unsupported':[{'requirement':x,'status':'unresolved'} for x in unsupported]}
+            'unsupported':unsupported,'requirements':structured}
 @app.get("/applications/{id}/comparison",response_model=ComparisonOut)
 def comparison(id:int,s:Session=Depends(db)):
     a=s.get(Application,id)
@@ -1570,12 +2039,15 @@ def comparison(id:int,s:Session=Depends(db)):
 def create_confirmations(id:int,s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
-    existing={x.requirement for x in s.query(MissingConfirmation).filter_by(application_id=id)}
+    existing_ids={x.requirement_id for x in s.query(MissingConfirmation).filter_by(application_id=id) if x.requirement_id is not None}
+    existing_text={x.requirement for x in s.query(MissingConfirmation).filter_by(application_id=id)}
     out=[]
     for record in _comparison(a,s)['unsupported']:
         req=record['requirement']
-        if req not in existing:
-            x=MissingConfirmation(application_id=id,requirement=req); s.add(x); out.append(x)
+        requirement_id=record.get("requirement_id")
+        if (requirement_id is not None and requirement_id in existing_ids) or req in existing_text:
+            continue
+        x=MissingConfirmation(application_id=id,requirement=req,requirement_id=requirement_id); s.add(x); out.append(x)
     s.commit()
     for x in out: s.refresh(x)
     return s.query(MissingConfirmation).filter_by(application_id=id).all()
@@ -1585,16 +2057,21 @@ def confirm_alias(id:int, payload:ConfirmationDecisionIn, s:Session=Depends(db))
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
     body=payload.model_dump()
-    req=payload.requirement.strip()
-    if not req: raise HTTPException(422,"requirement is required")
+    comparison_rows=_comparison(a,s)["unsupported"]
+    target=None
+    if payload.requirement_id is not None:
+        target=next((record for record in comparison_rows if record.get("requirement_id")==payload.requirement_id),None)
+    elif payload.requirement:
+        target=next((record for record in comparison_rows if record.get("requirement")==payload.requirement.strip()),None)
+    if target is None: raise HTTPException(422,"requirement is not an unsupported application requirement")
+    requirement_id=target.get("requirement_id")
+    req=target["requirement"]
     decision=str(payload.decision or payload.status or 'unresolved').lower()
     status={'confirm':'confirmed','confirmed':'confirmed','reject':'rejected','rejected':'rejected'}.get(decision,'unresolved')
-    known={record["requirement"] for record in _comparison(a,s)["unsupported"]}
-    if req not in known: raise HTTPException(422,"requirement is not an unsupported application requirement")
-    o=s.query(MissingConfirmation).filter_by(application_id=id,requirement=req).first()
+    o=s.query(MissingConfirmation).filter_by(application_id=id,requirement_id=requirement_id).first() if requirement_id is not None else s.query(MissingConfirmation).filter_by(application_id=id,requirement=req).first()
     if not o:
-        o=MissingConfirmation(application_id=id,requirement=req,status=status,context=body); s.add(o)
-    else: o.status=status; o.context=body
+        o=MissingConfirmation(application_id=id,requirement=req,requirement_id=requirement_id,status=status,context=body); s.add(o)
+    else: o.status=status; o.context=body; o.requirement_id=requirement_id or o.requirement_id
     s.commit(); s.refresh(o); return o
 @app.get("/applications/{id}/missing-confirmations",response_model=list[ConfirmationOut])
 def list_confirmations(id:int,s:Session=Depends(db)):
@@ -1605,6 +2082,10 @@ def update_confirmation(id:int,x:ConfirmationIn,s:Session=Depends(db)):
     o=s.get(MissingConfirmation,id)
     if not o: raise HTTPException(404,"confirmation not found")
     if x.status not in {'confirmed','rejected','unresolved'}: raise HTTPException(422,"invalid confirmation status")
+    if x.requirement_id is not None:
+        if not s.get(JobRequirement,x.requirement_id) or s.get(JobRequirement,x.requirement_id).application_id != o.application_id:
+            raise HTTPException(422,"requirement does not belong to confirmation application")
+        o.requirement_id=x.requirement_id
     o.status=x.status; o.context=x.context; s.commit(); s.refresh(o); return o
 @app.post("/applications/{id}/proposals",response_model=ProposalOut)
 def proposal(id:int,x:ProposalIn,s:Session=Depends(db)):
