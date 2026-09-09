@@ -44,7 +44,7 @@ Updated: September 7, 2026
 - [ ] Add submitted-revision tracking
 - [ ] Add structured job requirements and evidence links
 - [ ] Improve matching classifications and scoring
-- [ ] Turn confirmed missing information into verified source records
+- [x] Turn confirmed missing information into verified source records
 - [x] Add an `LLMProvider` interface
 - [x] Add versioned AI prompts and structured output schemas
 - [x] Generate evidence-grounded optimization proposals
