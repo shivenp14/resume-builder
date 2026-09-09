@@ -781,6 +781,13 @@ def edit_resume(id:int,x:ResumeIn,s:Session=Depends(db)):
     explicit_personal_information="personal_information_id" in x.model_fields_set
     if not explicit_personal_information and o.personal_information_id is not None:
         values["personal_information_id"]=o.personal_information_id
+    elif explicit_personal_information and values.get("personal_information_id") is None:
+        # A durable unlink must not leave the legacy contact payload around:
+        # startup backfill would otherwise interpret it as an un-migrated
+        # record and immediately re-link the profile.
+        settings=dict(values.get("layout_settings") or {})
+        settings.pop("contact",None)
+        values["layout_settings"]=settings
     values=_prepare_resume_personal_information(values,s,
         migrate_legacy=not explicit_personal_information)
     for k,v in values.items(): setattr(o,k,v)
