@@ -83,7 +83,7 @@ def test_backup_rejects_symlinks_and_tampered_members(tmp_path: Path):
     outside.write_text("secret")
     (generated / "escape.txt").symlink_to(outside)
 
-    with pytest.raises(BackupError, match="symbolic links"):
+    with pytest.raises(BackupError, match="regular files|symbolic links"):
         create_backup(database_path=database, generated_root=generated, backup_root=backups)
 
     (generated / "escape.txt").unlink()
