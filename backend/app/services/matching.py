@@ -27,10 +27,11 @@ SCORING_VERSION = "matching-v1"
 WELL_REPRESENTED_THRESHOLD = 75
 WEAKLY_REPRESENTED_THRESHOLD = 1
 
-# Keep language markers attached to a token.  The final alternation handles
-# ordinary words while the first two alternatives keep ``C++`` and ``C#``
-# distinct from the bare token ``C``.
-_TOKEN_RE = re.compile(r"[a-z0-9]+(?:\+\+|#)|[a-z0-9]+", re.IGNORECASE)
+# Keep language markers and hyphenated names attached to a token.  This is
+# intentionally stricter than ordinary word tokenization: ``react-native``
+# must not become the two tokens ``react`` and ``native``.  The optional
+# suffix preserves ``C++`` and ``C#`` as distinct from the bare token ``C``.
+_TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*(?:\+\+|#)?", re.IGNORECASE)
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
     "has", "have", "in", "is", "it", "of", "on", "or", "the", "to",
@@ -77,6 +78,27 @@ def _source_item_ids(base_entries: Iterable[Any]) -> set[int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _selected_bullet_ids(base_entries: Iterable[Any]) -> dict[int, set[int]]:
+    """Return only bullet IDs explicitly selected on each base entry."""
+
+    selected: dict[int, set[int]] = {}
+    for entry in base_entries:
+        item_id = _get(entry, "content_item_id")
+        if item_id is None:
+            continue
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            continue
+        values = _get(entry, "selected_bullet_ids", ()) or ()
+        selected[item_id] = {
+            int(bullet_id)
+            for bullet_id in values
+            if bullet_id is not None
+        }
+    return selected
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
@@ -157,7 +179,15 @@ def _overlap(requirement_text: str, source_text: str) -> float:
     return len(required & _tokens(source_text)) / len(required)
 
 
-def _link_source(link: Any, items_by_id: Mapping[int, Any], bullets_by_id: Mapping[int, Any], verified_ids: set[int], base_ids: set[int], relationships_by_item: Mapping[int, set[int]]) -> tuple[bool, bool, str]:
+def _link_source(
+    link: Any,
+    items_by_id: Mapping[int, Any],
+    bullets_by_id: Mapping[int, Any],
+    verified_ids: set[int],
+    base_ids: set[int],
+    selected_bullet_ids: Mapping[int, set[int]],
+    relationships_by_item: Mapping[int, set[int]],
+) -> tuple[bool, bool, str]:
     """Return (valid, in_base, human-readable source label)."""
 
     source_type = str(_get(link, "source_type", "") or "")
@@ -201,7 +231,14 @@ def _link_source(link: Any, items_by_id: Mapping[int, Any], bullets_by_id: Mappi
         label = f"skill {skill_id}"
     else:
         return False, False, "missing evidence source"
-    return True, bool(content_item_id in base_ids if content_item_id is not None else False), label
+    if bullet_id is not None:
+        in_base = bool(
+            content_item_id in base_ids
+            and bullet_id in selected_bullet_ids.get(content_item_id, set())
+        )
+    else:
+        in_base = bool(content_item_id in base_ids if content_item_id is not None else False)
+    return True, in_base, label
 
 
 def score_requirement(
@@ -222,7 +259,9 @@ def score_requirement(
     """
 
     text = str(_get(requirement, "text", _get(requirement, "requirement", "")) or "").strip()
+    base_entries = list(base_entries)
     base_ids = _source_item_ids(base_entries)
+    selected_bullet_ids = _selected_bullet_ids(base_entries)
     item_rows = list(items)
     items_by_id = {int(_get(item, "id")): item for item in item_rows if _get(item, "id") is not None}
     bullets_by_item = {int(item_id): list(bullet_rows) for item_id, bullet_rows in bullets_by_item.items()}
@@ -261,6 +300,7 @@ def score_requirement(
                        skill_ids=matched_skill_ids,
                        reason=f"verified skill {', '.join(names)} is linked to {'the base resume' if in_base else 'the source library'}")
         for bullet_id, bullet_text in _bullet_texts(item, bullets_by_item):
+            bullet_in_base = in_base and bullet_id in selected_bullet_ids.get(item_id, set())
             bullet_skill_ids = {
                 skill_id for skill_id in requirement_skill_ids
                 if any(_contains_phrase(bullet_text, alias) for alias in _skill_aliases(verified_skills[skill_id]))
@@ -272,17 +312,17 @@ def score_requirement(
                 # skill relationship is the stronger signal.  This keeps an
                 # unlinked mention explainably below the well-represented
                 # threshold while still surfacing it as weak coverage.
-                bullet_score = 85 if (in_base and bullet_skill_ids & item_skill_ids) else (70 if in_base else 55)
-                add_signal(bullet_score, source="bullet_skill", in_base=in_base, item_id=item_id, bullet_id=bullet_id,
+                bullet_score = 85 if (bullet_in_base and bullet_skill_ids & item_skill_ids) else (70 if bullet_in_base else 55)
+                add_signal(bullet_score, source="bullet_skill", in_base=bullet_in_base, item_id=item_id, bullet_id=bullet_id,
                            skill_ids=bullet_skill_ids,
                            reason=f"bullet {bullet_id} mentions a matched normalized skill")
             elif phrase:
-                add_signal(80 if in_base else 50, source="bullet_phrase", in_base=in_base, item_id=item_id, bullet_id=bullet_id,
+                add_signal(80 if bullet_in_base else 50, source="bullet_phrase", in_base=bullet_in_base, item_id=item_id, bullet_id=bullet_id,
                            reason=f"requirement phrase appears in bullet {bullet_id}")
             elif overlap > 0:
                 # Partial overlap is useful context but should not masquerade
                 # as a verified match for a multi-token requirement.
-                add_signal(round((55 if in_base else 35) * overlap), source="bullet_terms", in_base=in_base,
+                add_signal(round((55 if bullet_in_base else 35) * overlap), source="bullet_terms", in_base=bullet_in_base,
                            item_id=item_id, bullet_id=bullet_id,
                            reason=f"bullet {bullet_id} shares {round(overlap * 100)}% of requirement terms")
         if item_overlap > 0 and not matched_skill_ids:
@@ -295,7 +335,10 @@ def score_requirement(
     evidence_ids: list[int] = []
     for link in evidence_links:
         link_id = _get(link, "id")
-        valid, in_base, label = _link_source(link, items_by_id, bullets_by_id, verified_ids, base_ids, relationships)
+        valid, in_base, label = _link_source(
+            link, items_by_id, bullets_by_id, verified_ids, base_ids,
+            selected_bullet_ids, relationships,
+        )
         if not valid:
             continue
         if link_id is not None:

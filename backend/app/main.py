@@ -2164,6 +2164,12 @@ def _comparison(a:Application,s:Session):
         elif classification == "library_only":
             library_only.append(term)
         base_record={**_requirement_response(requirement,s),**scored}
+        if classification == "unsupported":
+            # The structured requirement projection uses the canonical
+            # classification.  The legacy ``unsupported`` array below keeps
+            # its historical ``unresolved`` status for existing clients.
+            base_record["legacy_status"] = base_record["status"]
+            base_record["status"] = "unsupported"
         # Keep the old unresolved status in the unsupported bucket while the
         # structured record exposes the finer-grained ``classification``.
         if classification == "unsupported":

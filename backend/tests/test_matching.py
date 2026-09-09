@@ -14,7 +14,7 @@ def _inputs(*, base=True, relationship=True, bullet_text="Built Python APIs", ve
         requirement=requirement,
         items=[item],
         bullets_by_item={1: [bullet]},
-        base_entries=[Record(content_item_id=1)] if base else [],
+        base_entries=[Record(content_item_id=1, selected_bullet_ids=[1])] if base else [],
         relationships_by_item={1: {1}} if relationship else {1: set()},
         skills=[skill],
     )
@@ -38,7 +38,9 @@ def test_same_verified_skill_outside_base_is_library_only():
 
 
 def test_partial_text_evidence_is_weak_and_explainable():
-    result = score_requirement(**_inputs(relationship=False))
+    inputs = _inputs(relationship=False, bullet_text="Built backend services")
+    inputs["requirement"] = Record(id=10, text="Build scalable services")
+    result = score_requirement(**inputs)
 
     assert result["classification"] == "weakly_represented"
     assert 0 < result["score"] < 75
@@ -78,3 +80,40 @@ def test_explicit_evidence_is_strong_and_source_scoped():
     assert result["classification"] == "well_represented"
     assert result["evidence_ids"] == [42]
     assert result["score_breakdown"]["explicit_evidence_ids"] == [42]
+
+
+def test_only_selected_base_bullets_count_as_base_evidence():
+    skill = Record(id=1, name="Python", aliases=[], verified=True)
+    item = Record(id=1, title="Builder", summary="", organization="", tags=[])
+    result = score_requirement(
+        Record(id=10, text="Python"),
+        items=[item],
+        bullets_by_item={1: [
+            Record(id=1, content_item_id=1, text="Unrelated work"),
+            Record(id=2, content_item_id=1, text="Built Python APIs"),
+        ]},
+        base_entries=[Record(content_item_id=1, selected_bullet_ids=[1])],
+        relationships_by_item={1: set()},
+        skills=[skill],
+    )
+
+    assert result["classification"] == "library_only"
+    assert result["matched_bullet_ids"] == [2]
+    assert all(not signal["in_base_resume"] for signal in result["signals"])
+
+
+def test_hyphenated_skill_does_not_match_spaced_requirement_without_alias():
+    skill = Record(id=1, name="React-Native", aliases=[], verified=True)
+    item = Record(id=1, title="Mobile", summary="", organization="", tags=[])
+    result = score_requirement(
+        Record(id=10, text="React Native"),
+        items=[item],
+        bullets_by_item={1: [Record(id=1, content_item_id=1, text="Used React-Native")]},
+        base_entries=[Record(content_item_id=1, selected_bullet_ids=[1])],
+        relationships_by_item={1: {1}},
+        skills=[skill],
+    )
+
+    assert result["classification"] == "unsupported"
+    assert result["score"] == 0
+    assert result["matched_skills"] == []
