@@ -19,13 +19,15 @@ _SEMANTIC_BULLET_FIELDS = (
     "is_locked",
     "was_rewritten",
 )
-_SEMANTIC_ITEM_FIELDS = ("title",)
+_SEMANTIC_ITEM_FIELDS = ("title", "skill_ids")
 _SEMANTIC_RENDERED_ENTRY_FIELDS = (
     "organization",
     "location",
     "dates",
     "summary",
     "skills",
+    "skill_ids",
+    "skill_names",
     "display_title",
 )
 

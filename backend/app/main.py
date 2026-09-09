@@ -20,6 +20,7 @@ from .services.codex_provider import CodexProvider, CodexProviderError, MODEL, R
 from .services.llm_prompts import PROMPT_VERSION
 from .services.llm_schemas import SCHEMA_VERSION
 from .services.revision_comparison import compare_snapshots
+from .services.skills import SkillNormalizationError, display_skill_name, normalize_skill_name
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
@@ -39,12 +40,40 @@ class ContentItem(Base):
     __tablename__="content_items"
     id: Mapped[int]=mapped_column(primary_key=True); type: Mapped[str]=mapped_column(String(40)); title: Mapped[str]=mapped_column(String(200)); organization: Mapped[str|None]=mapped_column(String(200)); location: Mapped[str|None]=mapped_column(String(200)); start_date: Mapped[str|None]=mapped_column(String(30)); end_date: Mapped[str|None]=mapped_column(String(30)); summary: Mapped[str|None]=mapped_column(Text); tags: Mapped[list]=mapped_column(JSON,default=list); is_archived: Mapped[bool]=mapped_column(Boolean,default=False); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
     bullets: Mapped[list["Bullet"]]=relationship(cascade="all, delete-orphan")
+    skill_relationships: Mapped[list["ContentItemSkill"]]=relationship(cascade="all, delete-orphan")
 class Bullet(Base):
     __tablename__="bullets"
     id: Mapped[int]=mapped_column(primary_key=True); content_item_id: Mapped[int]=mapped_column(ForeignKey("content_items.id")); text: Mapped[str]=mapped_column(Text); tags: Mapped[list]=mapped_column(JSON,default=list); supporting_facts: Mapped[list]=mapped_column(JSON,default=list); is_locked: Mapped[bool]=mapped_column(Boolean,default=False); is_preferred: Mapped[bool]=mapped_column(Boolean,default=False)
 class Skill(Base):
     __tablename__="skills"
     id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120),unique=True); category: Mapped[str|None]=mapped_column(String(80)); aliases: Mapped[list]=mapped_column(JSON,default=list); notes: Mapped[str|None]=mapped_column(Text); verified: Mapped[bool]=mapped_column(Boolean,default=False)
+    alias_rows: Mapped[list["SkillAlias"]]=relationship(cascade="all, delete-orphan")
+    source_relationships: Mapped[list["ContentItemSkill"]]=relationship(cascade="all, delete-orphan")
+class SkillAlias(Base):
+    """A normalized, globally unique alternate name for a canonical skill."""
+    __tablename__="skill_aliases"
+    __table_args__=(UniqueConstraint("normalized_name",name="uq_skill_alias_normalized_name"),
+                    UniqueConstraint("skill_id","normalized_name",name="uq_skill_alias_skill_name"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    skill_id: Mapped[int]=mapped_column(ForeignKey("skills.id",ondelete="CASCADE"),index=True)
+    alias: Mapped[str]=mapped_column(String(120))
+    normalized_name: Mapped[str]=mapped_column(String(120),index=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+class ContentItemSkill(Base):
+    """Explicit source-library relationship between content and a skill."""
+    __tablename__="content_item_skills"
+    __table_args__=(UniqueConstraint("content_item_id","skill_id",name="uq_content_item_skill"),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    content_item_id: Mapped[int]=mapped_column(ForeignKey("content_items.id",ondelete="CASCADE"),index=True)
+    skill_id: Mapped[int]=mapped_column(ForeignKey("skills.id",ondelete="CASCADE"),index=True)
+    source: Mapped[str]=mapped_column(String(40),default="manual")
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+
+# ``ContentSkill`` was the name used by an early local prototype.  Retaining
+# the alias costs nothing and lets imports of that prototype keep working.
+ContentSkill = ContentItemSkill
+SkillRelationship = ContentItemSkill
+SourceSkill = ContentItemSkill
 class BaseResume(Base):
     __tablename__="base_resumes"
     id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); template_id: Mapped[str]=mapped_column(String(80),default="default"); section_order: Mapped[list]=mapped_column(JSON,default=list); layout_settings: Mapped[dict]=mapped_column(JSON,default=dict)
@@ -163,6 +192,150 @@ def _append_bullet_version(s: Session, bullet: Bullet, *, action: str, changed_f
         snapshot=snapshot,created_at=now())
     s.add(version)
     return version
+
+
+def _skill_alias_values(skill: Skill, s: Session | None = None) -> list[str]:
+    """Read normalized aliases while retaining the legacy JSON fallback."""
+
+    values: list[str] = []
+    if s is not None:
+        rows = s.query(SkillAlias).filter_by(skill_id=skill.id).order_by(SkillAlias.id).all()
+        values.extend(row.alias for row in rows)
+    # A database can be read during a rolling upgrade before the alias
+    # backfill has run.  The old JSON column remains the compatibility source
+    # until normalized rows exist.
+    values.extend(skill.aliases or [])
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            display = display_skill_name(value)
+            key = normalize_skill_name(display)
+        except SkillNormalizationError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            result.append(display)
+    return result
+
+
+def _skill_name_index(s: Session) -> dict[str, set[int]]:
+    """Build a collision-aware canonical/alias index for safe matching."""
+
+    index: dict[str, set[int]] = {}
+    for skill in s.query(Skill).order_by(Skill.id).all():
+        try:
+            index.setdefault(normalize_skill_name(skill.name), set()).add(skill.id)
+        except SkillNormalizationError:
+            continue
+        for alias in _skill_alias_values(skill, s):
+            try:
+                index.setdefault(normalize_skill_name(alias), set()).add(skill.id)
+            except SkillNormalizationError:
+                continue
+    return index
+
+
+def _skill_for_name(value: object, s: Session) -> Skill | None:
+    """Resolve a canonical or alias name only when it is unambiguous."""
+
+    try:
+        key = normalize_skill_name(value)
+    except SkillNormalizationError:
+        return None
+    ids = _skill_name_index(s).get(key, set())
+    if len(ids) != 1:
+        return None
+    return s.get(Skill, next(iter(ids)))
+
+
+def _sync_skill_aliases(s: Session, skill: Skill, aliases: list[str], *, strict: bool) -> list[str]:
+    """Validate and persist aliases in both normalized and legacy storage."""
+
+    try:
+        canonical_key = normalize_skill_name(skill.name)
+    except SkillNormalizationError as exc:
+        raise ValueError(str(exc)) from exc
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in aliases:
+        try:
+            alias = display_skill_name(raw)
+            key = normalize_skill_name(alias)
+        except SkillNormalizationError as exc:
+            if strict:
+                raise ValueError(str(exc)) from exc
+            continue
+        if key == canonical_key or key in seen:
+            # Treating the canonical spelling as an idempotent alias avoids
+            # creating a self-collision when clients submit a merged list.
+            continue
+        # A normalized alias is globally unique.  Checking the table and the
+        # in-memory legacy JSON values makes this safe during a rolling
+        # migration, before every row has been backfilled.
+        owner = s.query(SkillAlias).filter_by(normalized_name=key).first()
+        if owner is not None and owner.skill_id != skill.id:
+            if strict:
+                raise ValueError(f"skill alias collides with skill {owner.skill_id}")
+            continue
+        for other in s.query(Skill).filter(Skill.id != skill.id).all():
+            other_keys: set[str] = set()
+            for other_value in [other.name, *(other.aliases or [])]:
+                try:
+                    other_keys.add(normalize_skill_name(other_value))
+                except SkillNormalizationError:
+                    continue
+            if key in other_keys:
+                if strict:
+                    raise ValueError(f"skill alias collides with skill {other.id}")
+                owner = True
+                break
+        if owner is True:
+            continue
+        seen.add(key)
+        cleaned.append(alias)
+        row = s.query(SkillAlias).filter_by(skill_id=skill.id, normalized_name=key).first()
+        if row is None:
+            s.add(SkillAlias(skill_id=skill.id, alias=alias, normalized_name=key))
+        else:
+            row.alias = alias
+    # Remove normalized rows no longer present when a skill is edited.  The
+    # legacy JSON list is updated below in the same transaction.
+    desired_keys = set(seen)
+    for row in s.query(SkillAlias).filter_by(skill_id=skill.id).all():
+        if row.normalized_name not in desired_keys:
+            s.delete(row)
+    # Keep old API/database consumers working.  This list is deterministic and
+    # contains the display spelling rather than opaque normalized keys.
+    skill.aliases = cleaned
+    return cleaned
+
+
+def _skill_response(skill: Skill, s: Session) -> dict[str, Any]:
+    try:
+        normalized_name = normalize_skill_name(skill.name)
+    except SkillNormalizationError:
+        normalized_name = None
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "normalized_name": normalized_name,
+        "category": skill.category,
+        "aliases": _skill_alias_values(skill, s),
+        "notes": skill.notes,
+        "verified": skill.verified,
+    }
+
+
+def _skill_link_response(link: ContentItemSkill, s: Session) -> dict[str, Any]:
+    skill = s.get(Skill, link.skill_id)
+    return {
+        "id": link.id,
+        "content_item_id": link.content_item_id,
+        "skill_id": link.skill_id,
+        "source": link.source,
+        "skill": _skill_response(skill, s) if skill else None,
+    }
 
 def _apply_sqlite_integrity_migrations() -> None:
     """Apply additive SQLite schema changes, indexes, and source-history backfills.
@@ -286,6 +459,27 @@ def _apply_sqlite_integrity_migrations() -> None:
     # idempotent and never rewrites existing history.
     MigrationSession=sessionmaker(bind=engine,expire_on_commit=False)
     with MigrationSession() as session:
+        # Normalize legacy JSON aliases into the relational table.  Conflicts
+        # are skipped rather than merged: preserving two user-created skills
+        # is safer than guessing which canonical skill should own an alias.
+        for skill in session.query(Skill).order_by(Skill.id).all():
+            _sync_skill_aliases(session, skill, list(skill.aliases or []), strict=False)
+        session.flush()
+        # Older imports commonly stored skill names in content-item tags.
+        # Only create a relationship when the tag resolves to exactly one
+        # canonical/alias owner; arbitrary tags remain untouched.
+        for item in session.query(ContentItem).order_by(ContentItem.id).all():
+            for tag in item.tags or []:
+                skill = _skill_for_name(tag, session)
+                if skill is None:
+                    continue
+                if not session.query(ContentItemSkill.id).filter_by(
+                    content_item_id=item.id, skill_id=skill.id
+                ).first():
+                    session.add(ContentItemSkill(
+                        content_item_id=item.id, skill_id=skill.id,
+                        source="tag-migration",
+                    ))
         for item in session.query(ContentItem).all():
             if not session.query(ContentItemVersion.id).filter_by(content_item_id=item.id).first():
                 _append_content_version(session,item,action="backfill",changed_fields=list(_CONTENT_VERSION_FIELDS))
@@ -300,11 +494,18 @@ def db():
     try: yield s
     finally: s.close()
 
-class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list)
-class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None
+class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list); skill_ids:list[int]=Field(default_factory=list)
+class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None; skill_ids:list[int]|None=None
 class DuplicateItemIn(BaseModel): title:str|None=None
 class BulletIn(BaseModel): text:str; tags:list[str]=Field(default_factory=list); supporting_facts:list[str]=Field(default_factory=list); is_locked:bool=False; is_preferred:bool=False
 class SkillIn(BaseModel): name:str; category:str|None=None; aliases:list[str]=Field(default_factory=list); notes:str|None=None; verified:bool=False
+class SkillPatch(BaseModel): name:str|None=None; category:str|None=None; aliases:list[str]|None=None; notes:str|None=None; verified:bool|None=None
+class ContentItemSkillIn(BaseModel):
+    skill_id:int|None=None
+    name:str|None=None
+    skill:str|None=None
+    source:str="manual"
+class SkillAliasIn(BaseModel): alias:str
 class ResumeIn(BaseModel): name:str; template_id:str="default"; section_order:list[str]=Field(default_factory=list); layout_settings:dict=Field(default_factory=dict)
 class EntryIn(BaseModel): content_item_id:int; selected_bullet_ids:list[int]=Field(default_factory=list); entry_order:int=0
 class AppIn(BaseModel):
@@ -375,7 +576,8 @@ class ContentItemOut(APIOut):
 class BulletOut(APIOut):
     id:int; content_item_id:int; text:str; tags:list[str]; supporting_facts:list[str]; is_locked:bool; is_preferred:bool
 class ContentItemWithBulletsOut(ContentItemOut): bullets:list[BulletOut] = Field(default_factory=list)
-class SkillOut(APIOut): id:int; name:str; category:str|None; aliases:list[str]; notes:str|None; verified:bool
+class SkillOut(APIOut): id:int; name:str; category:str|None; aliases:list[str]; notes:str|None; verified:bool; normalized_name:str|None=None
+class ContentItemSkillOut(APIOut): id:int; content_item_id:int; skill_id:int; source:str; skill:dict[str,Any]|None=None
 class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
 class ApplicationOut(APIOut):
@@ -428,7 +630,11 @@ app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="che
 def health(): return {"status":"ok"}
 @app.post("/content-items",response_model=ContentItemOut)
 def create_item(x:ItemIn,s:Session=Depends(db)):
-    o=ContentItem(**x.model_dump()); s.add(o); s.flush()
+    values=x.model_dump(); skill_ids=values.pop("skill_ids",[])
+    if len(skill_ids)!=len(set(skill_ids)): raise HTTPException(422,"skill_ids must be unique")
+    if any(not s.get(Skill,skill_id) for skill_id in skill_ids): raise HTTPException(404,"skill not found")
+    o=ContentItem(**values); s.add(o); s.flush()
+    for skill_id in skill_ids: s.add(ContentItemSkill(content_item_id=o.id,skill_id=skill_id,source="manual"))
     _append_content_version(s,o,action="created",changed_fields=list(_CONTENT_VERSION_FIELDS))
     s.commit(); s.refresh(o); return o
 @app.get("/content-items",response_model=list[ContentItemOut])
@@ -474,8 +680,21 @@ def edit_item(id:int,x:ItemPatch,s:Session=Depends(db)):
     o=s.get(ContentItem,id)
     if not o: raise HTTPException(404,"content item not found")
     values=x.model_dump(exclude_unset=True)
+    skill_ids=values.pop("skill_ids",None)
+    if skill_ids is not None:
+        if len(skill_ids)!=len(set(skill_ids)): raise HTTPException(422,"skill_ids must be unique")
+        if any(not s.get(Skill,skill_id) for skill_id in skill_ids): raise HTTPException(404,"skill not found")
     changed=[k for k,v in values.items() if getattr(o,k)!=v]
     for k,v in values.items(): setattr(o,k,v)
+    if skill_ids is not None:
+        existing_links=s.query(ContentItemSkill).filter_by(content_item_id=id).all()
+        existing_by_skill={link.skill_id:link for link in existing_links}
+        wanted=set(skill_ids)
+        for link in existing_links:
+            if link.skill_id not in wanted: s.delete(link)
+        for skill_id in skill_ids:
+            if skill_id not in existing_by_skill:
+                s.add(ContentItemSkill(content_item_id=id,skill_id=skill_id,source="manual"))
     if changed:
         o.updated_at=now()
         s.flush()
@@ -536,6 +755,8 @@ def duplicate_item(id:int,x:DuplicateItemIn|None=None,s:Session=Depends(db)):
                 s.add(copied); s.flush()
                 _append_bullet_version(s,copied,action="created",changed_fields=list(_BULLET_VERSION_FIELDS))
                 copied_bullets.append(copied)
+            for link in _item_skill_links([source.id],s).get(source.id,[]):
+                s.add(ContentItemSkill(content_item_id=duplicate.id,skill_id=link.skill_id,source=link.source))
             s.flush()
         s.commit(); s.refresh(duplicate)
         for bullet in copied_bullets: s.refresh(bullet)
@@ -592,10 +813,156 @@ def delete_bullet(id:int,s:Session=Depends(db)):
     s.delete(o); s.commit(); return {"deleted":True}
 @app.post("/skills",response_model=SkillOut)
 def add_skill(x:SkillIn,s:Session=Depends(db)):
-    if s.query(Skill).filter_by(name=x.name).first(): raise HTTPException(409,"skill exists")
-    o=Skill(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
+    try:
+        name = display_skill_name(x.name)
+        key = normalize_skill_name(name)
+    except SkillNormalizationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if _skill_name_index(s).get(key):
+        raise HTTPException(409,"skill name or alias already exists")
+    o=Skill(name=name,category=x.category,notes=x.notes,verified=x.verified,aliases=[])
+    s.add(o)
+    try:
+        s.flush()
+        _sync_skill_aliases(s,o,x.aliases,strict=True)
+        s.commit(); s.refresh(o)
+    except (ValueError, IntegrityError) as exc:
+        s.rollback()
+        message = str(exc.orig) if isinstance(exc, IntegrityError) and exc.orig else str(exc)
+        raise HTTPException(409, message or "skill name or alias already exists") from exc
+    return _skill_response(o,s)
 @app.get("/skills",response_model=list[SkillOut])
-def skills(s:Session=Depends(db)): return s.query(Skill).all()
+def skills(s:Session=Depends(db)): return [_skill_response(skill,s) for skill in s.query(Skill).order_by(Skill.id).all()]
+@app.patch("/skills/{id}",response_model=SkillOut)
+def edit_skill(id:int,x:SkillPatch,s:Session=Depends(db)):
+    skill=s.get(Skill,id)
+    if not skill: raise HTTPException(404,"skill not found")
+    values=x.model_dump(exclude_unset=True)
+    new_name=skill.name
+    if "name" in values:
+        try:
+            new_name=display_skill_name(values.pop("name"))
+            key=normalize_skill_name(new_name)
+        except SkillNormalizationError as exc:
+            raise HTTPException(422,str(exc)) from exc
+        owners={owner for owner in _skill_name_index(s).get(key,set()) if owner != skill.id}
+        if owners: raise HTTPException(409,"skill name or alias already exists")
+        skill.name=new_name
+    aliases=values.pop("aliases",None)
+    for key,value in values.items(): setattr(skill,key,value)
+    try:
+        s.flush()
+        if aliases is not None:
+            _sync_skill_aliases(s,skill,aliases,strict=True)
+        else:
+            # A canonical rename still needs the legacy rows rechecked.
+            _sync_skill_aliases(s,skill,_skill_alias_values(skill,s),strict=True)
+        s.commit(); s.refresh(skill)
+    except (ValueError, IntegrityError) as exc:
+        s.rollback()
+        message = str(exc.orig) if isinstance(exc, IntegrityError) and exc.orig else str(exc)
+        raise HTTPException(409,message or "skill name or alias already exists") from exc
+    return _skill_response(skill,s)
+@app.post("/skills/{id}/aliases",response_model=SkillOut)
+def add_skill_alias(id:int,x:SkillAliasIn,s:Session=Depends(db)):
+    skill=s.get(Skill,id)
+    if not skill: raise HTTPException(404,"skill not found")
+    aliases=_skill_alias_values(skill,s)
+    aliases.append(x.alias)
+    try:
+        _sync_skill_aliases(s,skill,aliases,strict=True)
+        s.commit(); s.refresh(skill)
+    except (ValueError, IntegrityError) as exc:
+        s.rollback()
+        message = str(exc.orig) if isinstance(exc, IntegrityError) and exc.orig else str(exc)
+        raise HTTPException(409,message or "skill alias already exists") from exc
+    return _skill_response(skill,s)
+@app.delete("/skills/{id}/aliases/{alias}",response_model=SkillOut)
+def remove_skill_alias(id:int,alias:str,s:Session=Depends(db)):
+    skill=s.get(Skill,id)
+    if not skill: raise HTTPException(404,"skill not found")
+    try:
+        key=normalize_skill_name(alias)
+    except SkillNormalizationError as exc:
+        raise HTTPException(422,str(exc)) from exc
+    row=s.query(SkillAlias).filter_by(skill_id=id,normalized_name=key).first()
+    legacy_match=False
+    for value in skill.aliases or []:
+        try:
+            if normalize_skill_name(value)==key:
+                legacy_match=True
+                break
+        except SkillNormalizationError:
+            continue
+    if row is None and not legacy_match:
+        raise HTTPException(404,"skill alias not found")
+    if row is not None: s.delete(row)
+    kept=[]
+    for value in skill.aliases or []:
+        try:
+            matches=normalize_skill_name(value)==key
+        except SkillNormalizationError:
+            matches=False
+        if not matches: kept.append(value)
+    skill.aliases=kept
+    s.commit(); s.refresh(skill)
+    return _skill_response(skill,s)
+@app.get("/skills/{id}",response_model=SkillOut)
+def get_skill(id:int,s:Session=Depends(db)):
+    skill=s.get(Skill,id)
+    if not skill: raise HTTPException(404,"skill not found")
+    return _skill_response(skill,s)
+def _requested_skill(x:ContentItemSkillIn,s:Session) -> Skill:
+    if x.skill_id is not None and (x.name is not None or x.skill is not None):
+        raise HTTPException(422,"provide either skill_id or skill name, not both")
+    if x.skill_id is not None:
+        skill=s.get(Skill,x.skill_id)
+        if not skill: raise HTTPException(404,"skill not found")
+        return skill
+    value=x.name if x.name is not None else x.skill
+    if value is None or not value.strip():
+        raise HTTPException(422,"skill_id or skill name is required")
+    skill=_skill_for_name(value,s)
+    if skill is None:
+        raise HTTPException(404,"skill not found or skill name is ambiguous")
+    return skill
+
+@app.post("/content-items/{id}/skills",response_model=ContentItemSkillOut)
+def add_content_item_skill(id:int,x:ContentItemSkillIn,s:Session=Depends(db)):
+    if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
+    skill=_requested_skill(x,s)
+    source=x.source.strip() if isinstance(x.source,str) else ""
+    if not source or len(source)>40: raise HTTPException(422,"skill relationship source must be 1-40 characters")
+    link=s.query(ContentItemSkill).filter_by(content_item_id=id,skill_id=skill.id).first()
+    if link is None:
+        link=ContentItemSkill(content_item_id=id,skill_id=skill.id,source=source)
+        s.add(link)
+    else:
+        link.source=source
+    try:
+        s.commit(); s.refresh(link)
+    except IntegrityError as exc:
+        s.rollback(); raise HTTPException(409,"skill relationship already exists") from exc
+    return _skill_link_response(link,s)
+
+@app.get("/content-items/{id}/skills",response_model=list[ContentItemSkillOut])
+def content_item_skills(id:int,s:Session=Depends(db)):
+    if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
+    links=s.query(ContentItemSkill).filter_by(content_item_id=id).order_by(ContentItemSkill.id).all()
+    return [_skill_link_response(link,s) for link in links]
+
+@app.delete("/content-items/{id}/skills/{skill_id}",response_model=MutationOut)
+def remove_content_item_skill(id:int,skill_id:int,s:Session=Depends(db)):
+    if not s.get(ContentItem,id): raise HTTPException(404,"content item not found")
+    link=s.query(ContentItemSkill).filter_by(content_item_id=id,skill_id=skill_id).first()
+    if not link: raise HTTPException(404,"skill relationship not found")
+    s.delete(link); s.commit(); return {"deleted":True}
+
+@app.get("/skills/{id}/content-items",response_model=list[ContentItemSkillOut])
+def skill_content_items(id:int,s:Session=Depends(db)):
+    if not s.get(Skill,id): raise HTTPException(404,"skill not found")
+    links=s.query(ContentItemSkill).filter_by(skill_id=id).order_by(ContentItemSkill.id).all()
+    return [_skill_link_response(link,s) for link in links]
 @app.post("/base-resumes",response_model=BaseResumeOut)
 def add_resume(x:ResumeIn,s:Session=Depends(db)):
     o=BaseResume(**x.model_dump()); s.add(o); s.commit(); s.refresh(o); return o
@@ -814,6 +1181,17 @@ def _run_error(exc):
     if isinstance(exc, CodexProviderError): return str(exc)[:2000]
     return "Unexpected Codex provider failure"
 
+
+def _item_skill_links(item_ids:list[int], s:Session) -> dict[int,list[ContentItemSkill]]:
+    """Return source skill relationships grouped without changing query order."""
+    if not item_ids:
+        return {}
+    links=s.query(ContentItemSkill).filter(ContentItemSkill.content_item_id.in_(item_ids)).order_by(ContentItemSkill.id).all()
+    grouped:dict[int,list[ContentItemSkill]]={item_id:[] for item_id in item_ids}
+    for link in links:
+        grouped.setdefault(link.content_item_id,[]).append(link)
+    return grouped
+
 def _verified_context(a:Application,s:Session) -> dict[str,Any]:
     base=s.get(BaseResume,a.base_resume_id)
     entries=s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id).order_by(BaseEntry.entry_order).all()
@@ -830,17 +1208,31 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
     all_items=item_query.order_by(ContentItem.id).all()
     item_ids=[item.id for item in all_items]
     all_bullets=s.query(Bullet).filter(Bullet.content_item_id.in_(item_ids)).order_by(Bullet.id).all() if item_ids else []
+    skill_links=_item_skill_links(item_ids,s)
+    skills_by_id={skill.id:skill for skill in s.query(Skill).order_by(Skill.id).all()}
+    verified_skill_ids={skill.id for skill in skills_by_id.values() if skill.verified}
     verified={
         "content_items":[{"id":item.id,"type":item.type,"title":item.title,"organization":item.organization,
             "location":item.location,"start_date":item.start_date,"end_date":item.end_date,
-            "summary":item.summary,"tags":item.tags,"is_archived":item.is_archived} for item in all_items],
+            "summary":item.summary,"tags":item.tags,"is_archived":item.is_archived,
+            "skill_ids":[link.skill_id for link in skill_links.get(item.id,[]) if link.skill_id in verified_skill_ids]}
+            for item in all_items],
         "bullets":[{"id":bullet.id,"content_item_id":bullet.content_item_id,"text":bullet.text,
             "tags":bullet.tags,"supporting_facts":bullet.supporting_facts,"is_locked":bullet.is_locked,
             "is_preferred":bullet.is_preferred} for bullet in all_bullets],
-        "skills":[{"id":skill.id,"name":skill.name,"category":skill.category,"aliases":skill.aliases,
-            "notes":skill.notes,"verified":skill.verified}
-            for skill in s.query(Skill).filter_by(verified=True).order_by(Skill.id)],
+        "skills":[_skill_response(skill,s) for skill in skills_by_id.values() if skill.verified],
+        "source_skills":[
+            {"content_item_id":item.id,
+             "skill_ids":[link.skill_id for link in skill_links.get(item.id,[]) if link.skill_id in verified_skill_ids],
+             "skills":[_skill_response(skills_by_id[link.skill_id],s)
+                       for link in skill_links.get(item.id,[])
+                       if link.skill_id in verified_skill_ids and link.skill_id in skills_by_id]}
+            for item in all_items if any(link.skill_id in verified_skill_ids for link in skill_links.get(item.id,[]))
+        ],
     }
+    # Keep an explicit relationship-named key for providers that distinguish
+    # source relationships from the flat verified skill catalog.
+    verified["skill_relationships"] = verified["source_skills"]
     source={"base_resume":{"id":base.id,"section_order":base.section_order,"layout_settings":base.layout_settings},
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
@@ -953,9 +1345,19 @@ def _comparison(a:Application,s:Session):
     else:
         item_query=item_query.filter_by(is_archived=False)
     all_items=item_query.all()
+    item_skill_links=_item_skill_links([item.id for item in all_items],s)
+    skill_index=_skill_name_index(s)
     represented=[]; weak=[]; library_only=[]; unsupported=[]
     for term in terms:
-        hits=[i for i in all_items if term.lower() in ((i.title or '')+' '+(i.summary or '')).lower() or any(term.lower() in b.text.lower() for b in i.bullets)]
+        try:
+            matching_skill_ids=skill_index.get(normalize_skill_name(term),set())
+        except SkillNormalizationError:
+            matching_skill_ids=set()
+        hits=[i for i in all_items if (
+            any(link.skill_id in matching_skill_ids for link in item_skill_links.get(i.id,[]))
+            or term.lower() in ((i.title or '')+' '+(i.summary or '')).lower()
+            or any(term.lower() in b.text.lower() for b in i.bullets)
+        )]
         if not hits: unsupported.append(term)
         elif any(i.id in base_ids for i in hits): represented.append(term)
         else: library_only.append(term)
@@ -1062,6 +1464,10 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
         {"content_item_id":entry.content_item_id,"bullet_ids":list(entry.selected_bullet_ids)} for entry in base_entries]
     item_ids=[entry["content_item_id"] for entry in selected]
     items={item.id:item for item in s.query(ContentItem).filter(ContentItem.id.in_(item_ids)).all()} if item_ids else {}
+    item_skill_links=_item_skill_links(item_ids,s)
+    related_skills={skill.id:skill for skill in s.query(Skill).filter(
+        Skill.id.in_({link.skill_id for links in item_skill_links.values() for link in links})
+    ).all()} if item_ids else {}
     requested_bullets=[bid for entry in selected for bid in entry.get("bullet_ids",[])]
     bullets={bullet.id:bullet for bullet in s.query(Bullet).filter(Bullet.id.in_(requested_bullets)).all()} if requested_bullets else {}
     changes={change["bullet_id"]:change for change in (proposal_payload or {}).get("bullet_changes",[])}
@@ -1084,6 +1490,10 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
                 "was_rewritten":bool(change)}
             entry_bullets.append(record); resolved_bullets.append(record)
         section=item.type.lower(); summary=item.summary or ""; display_title=item.title
+        source_skill_records=[related_skills[link.skill_id] for link in item_skill_links.get(item.id,[])
+                              if link.skill_id in related_skills]
+        source_skill_ids=[skill.id for skill in source_skill_records]
+        source_skill_names=[skill.name for skill in source_skill_records]
         if section=="education" and summary.startswith("GPA:"):
             parts=summary.split("; Coursework:",1); display_title=f"{item.title}; {parts[0]}"
             summary=f"Coursework:{parts[1]}" if len(parts)>1 else ""
@@ -1094,6 +1504,7 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
             "organization":item.organization or "","location":item.location or "",
             "dates":" -- ".join(x for x in (item.start_date,item.end_date) if x),
             "skills":item.summary or "" if section=="project" else "",
+            "skill_ids":source_skill_ids,"skill_names":source_skill_names,
             "summary":summary if section!="project" else "","bullets":entry_bullets})
 
     configured=[str(section).lower() for section in (base.section_order or [])]
@@ -1120,9 +1531,14 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
     if linkedin and not linkedin.startswith(("http://","https://")):
         contact["linkedin_label"]=linkedin.rstrip("/"); contact["linkedin"]="https://"+linkedin
     snapshot={"contact":contact,"sections":sections,
-        "content_items":[{"id":items[item_id].id,"title":items[item_id].title} for item_id in item_ids],
+        "content_items":[{"id":items[item_id].id,"title":items[item_id].title,
+                           "skill_ids":[skill.id for skill in related_skills.values()
+                                         if skill.id in {link.skill_id for link in item_skill_links.get(item_id,[])}]}
+                         for item_id in item_ids],
         "bullets":resolved_bullets,"entries":[{"content_item_id":entry["content_item_id"],
-            "bullet_ids":list(entry.get("bullet_ids",[]))} for entry in selected]}
+            "bullet_ids":list(entry.get("bullet_ids",[])),
+            "skill_ids":[link.skill_id for link in item_skill_links.get(entry["content_item_id"],[])]}
+            for entry in selected]}
     if proposal_payload is not None:
         snapshot["provenance"]={"proposal_id":proposal_id,"source_fingerprint":proposal_payload.get("source_fingerprint"),
             "prompt_version":proposal_payload.get("prompt_version"),"schema_version":proposal_payload.get("schema_version"),
