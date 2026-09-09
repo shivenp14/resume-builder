@@ -202,3 +202,44 @@ def test_legacy_confirmation_migration_installs_ownership_guards(tmp_path, monke
             connection.execute(text(
                 "INSERT INTO confirmation_materializations (id, confirmation_id, application_id, requirement_id, source_type, skill_id, idempotency_key, payload_hash, source_fingerprint, source_payload, created_at) VALUES (1, 1, 2, 10, 'skill', 1, 'bad', 'hash', 'fingerprint', '{}', CURRENT_TIMESTAMP)"
             ))
+
+
+def test_same_application_requirement_reassignment_is_valid_before_materialization(client):
+    application, _, _, docker, confirmation = _application(client)
+    requirements = client.get(f"/applications/{application['id']}/requirements").json()
+    other = next(row for row in requirements if row["id"] != docker["id"])
+    reassigned = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "unresolved", "requirement_id": other["id"], "context": {},
+    })
+    assert reassigned.status_code == 200, reassigned.text
+    restored = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "unresolved", "requirement_id": docker["id"], "context": {},
+    })
+    assert restored.status_code == 200, restored.text
+
+
+def test_materialized_confirmation_ownership_is_immutable_in_sqlite(client):
+    application, _, _, docker, confirmation = _application(client)
+    materialized = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "confirmed", "context": {"source_type": "skill", "name": "Docker"},
+    })
+    assert materialized.status_code == 200, materialized.text
+    requirements = client.get(f"/applications/{application['id']}/requirements").json()
+    other = next(row for row in requirements if row["id"] != docker["id"])
+
+    # The test fixture creates tables directly; install the additive migration
+    # triggers explicitly before exercising the direct-DB boundary.
+    main._apply_sqlite_integrity_migrations()
+    with main.engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(text(
+                "UPDATE missing_confirmations SET requirement_id=:requirement_id WHERE id=:confirmation_id"
+            ), {"requirement_id": other["id"], "confirmation_id": confirmation["id"]})
+        with pytest.raises(IntegrityError):
+            connection.execute(text(
+                "UPDATE missing_confirmations SET application_id=999 WHERE id=:confirmation_id"
+            ), {"confirmation_id": confirmation["id"]})
+        with pytest.raises(IntegrityError):
+            connection.execute(text(
+                "UPDATE job_requirements SET application_id=999 WHERE id=:requirement_id"
+            ), {"requirement_id": docker["id"]})

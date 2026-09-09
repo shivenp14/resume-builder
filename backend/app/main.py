@@ -899,6 +899,21 @@ def _apply_sqlite_integrity_migrations() -> None:
             END
         """))
         connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS missing_confirmations_materialized_owner_guard
+            BEFORE UPDATE OF application_id, requirement_id ON missing_confirmations
+            WHEN EXISTS (
+                    SELECT 1 FROM confirmation_materializations AS m
+                    WHERE m.confirmation_id = OLD.id
+                )
+              AND (
+                    NEW.application_id != OLD.application_id
+                    OR NEW.requirement_id IS NOT OLD.requirement_id
+                )
+            BEGIN
+                SELECT RAISE(ABORT, 'materialized confirmation ownership is immutable');
+            END
+        """))
+        connection.execute(text("""
             CREATE TRIGGER IF NOT EXISTS confirmation_materializations_owner_insert_guard
             BEFORE INSERT ON confirmation_materializations
             WHEN NOT EXISTS (
@@ -928,6 +943,17 @@ def _apply_sqlite_integrity_migrations() -> None:
             )
             BEGIN
                 SELECT RAISE(ABORT, 'materialization sources must share application and requirement ownership');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS job_requirements_confirmation_owner_guard
+            BEFORE UPDATE OF id, application_id ON job_requirements
+            WHEN EXISTS (
+                    SELECT 1 FROM missing_confirmations AS c
+                    WHERE c.requirement_id = OLD.id
+                )
+            BEGIN
+                SELECT RAISE(ABORT, 'requirement ownership is referenced by a confirmation');
             END
         """))
 
