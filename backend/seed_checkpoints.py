@@ -8,7 +8,8 @@ from pathlib import Path
 
 from backend.app.main import (ROOT, Application, BaseEntry, BaseResume, Bullet,
     BulletVersion, ContentItem, ContentItemVersion, JobAnalysis,
-    MissingConfirmation, PersonalInformation, Proposal, Revision, SessionLocal, Skill, analyze_text,
+    ConfirmationMaterialization, MissingConfirmation, PersonalInformation, Proposal, Revision,
+    RequirementEvidenceLink, JobRequirement, ApplicationStatusHistory, SessionLocal, Skill, analyze_text,
     _append_bullet_version, _append_content_version, _BULLET_VERSION_FIELDS,
     _CONTENT_VERSION_FIELDS, _contact_to_personal_values, _backfill_legacy_contacts)
 
@@ -112,7 +113,12 @@ def seed() -> None:
     folders = sorted(path for path in CHECKPOINTS.iterdir() if (path / "resume.tex").exists())
     with SessionLocal() as session:
         _clear_source_history(session)
-        for model in (Revision, Proposal, MissingConfirmation, JobAnalysis, Application, BaseEntry, Bullet, ContentItem, Skill, BaseResume, PersonalInformation):
+        # Delete child/audit rows explicitly so seed replacement remains safe
+        # when SQLite foreign keys are enabled by a newer application.
+        for model in (Revision, Proposal, ConfirmationMaterialization,
+                      RequirementEvidenceLink, MissingConfirmation, JobAnalysis,
+                      JobRequirement, ApplicationStatusHistory, Application, BaseEntry, Bullet, ContentItem,
+                      Skill, BaseResume, PersonalInformation):
             session.query(model).delete()
         bases = {}
         for folder in folders:
