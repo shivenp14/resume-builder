@@ -517,7 +517,7 @@ class BulletVersionOut(APIOut):
 class ComparisonOut(APIOut):
     well_represented:list[str]; weakly_represented:list[str]; library_only:list[str]; unsupported:list[dict[str,str]]
 class SnapshotOut(APIOut):
-    contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; personal_information:dict[str,Any]|None=None; provenance:dict[str,Any]|None=None
+    contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; provenance:dict[str,Any]|None=None
 class GenerationOut(RevisionOut): proposal_id:int; latex_url:str; pdf_url:str
 class RenderOut(APIOut): latex:str
 
@@ -750,18 +750,19 @@ def delete_personal_information(id:int,s:Session=Depends(db)):
         raise HTTPException(409,"personal information is linked to a base resume")
     s.delete(o); s.commit(); return {"deleted":True}
 
-def _prepare_resume_personal_information(values:dict[str,Any],s:Session) -> dict[str,Any]:
+def _prepare_resume_personal_information(values:dict[str,Any],s:Session, *, migrate_legacy:bool=True) -> dict[str,Any]:
     personal_id=values.get("personal_information_id")
     if personal_id is not None and not s.get(PersonalInformation,personal_id):
         raise HTTPException(404,"personal information not found")
-    if personal_id is None and "contact" in (values.get("layout_settings") or {}):
+    if migrate_legacy and personal_id is None and "contact" in (values.get("layout_settings") or {}):
         personal=PersonalInformation(**_contact_to_personal_values(values["layout_settings"].get("contact")))
         s.add(personal); s.flush(); values["personal_information_id"]=personal.id
     return values
 
 @app.post("/base-resumes",response_model=BaseResumeOut)
 def add_resume(x:ResumeIn,s:Session=Depends(db)):
-    values=_prepare_resume_personal_information(x.model_dump(),s)
+    values=_prepare_resume_personal_information(x.model_dump(),s,
+        migrate_legacy="personal_information_id" not in x.model_fields_set)
     o=BaseResume(**values); s.add(o); s.commit(); s.refresh(o); return o
 @app.get("/base-resumes",response_model=list[BaseResumeOut])
 def resumes(s:Session=Depends(db)):
@@ -777,9 +778,11 @@ def edit_resume(id:int,x:ResumeIn,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
     if not o: raise HTTPException(404,"base resume not found")
     values=x.model_dump()
-    if values.get("personal_information_id") is None and o.personal_information_id is not None:
+    explicit_personal_information="personal_information_id" in x.model_fields_set
+    if not explicit_personal_information and o.personal_information_id is not None:
         values["personal_information_id"]=o.personal_information_id
-    values=_prepare_resume_personal_information(values,s)
+    values=_prepare_resume_personal_information(values,s,
+        migrate_legacy=not explicit_personal_information)
     for k,v in values.items(): setattr(o,k,v)
     s.commit(); return o
 @app.post("/base-resumes/{id}/entries",response_model=BaseEntryOut)
@@ -1010,9 +1013,14 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
             "notes":skill.notes,"verified":skill.verified}
             for skill in s.query(Skill).filter_by(verified=True).order_by(Skill.id)],
     }
-    source={"base_resume":{"id":base.id,"section_order":base.section_order,"layout_settings":base.layout_settings,
-        "personal_information_id":base.personal_information_id,
-        "personal_information":{field:getattr(personal,field) for field in _PERSONAL_INFORMATION_FIELDS} if personal else _contact_to_personal_values((base.layout_settings or {}).get("contact"))},
+    layout_settings=dict(base.layout_settings or {})
+    # Once a typed record is linked, legacy contact metadata is only a
+    # migration fallback and must not keep proposals stale. Hash only the
+    # renderable projection, never private/non-render profile fields.
+    legacy_contact=layout_settings.pop("contact",None)
+    canonical_contact=_personal_contact(personal) if personal else _personal_contact(None,legacy_contact)
+    source={"base_resume":{"id":base.id,"section_order":base.section_order,"layout_settings":layout_settings,
+        "personal_information_id":base.personal_information_id,"contact":canonical_contact},
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
     fingerprint=hashlib.sha256(json.dumps(source,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
@@ -1299,9 +1307,6 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
         "content_items":[{"id":items[item_id].id,"title":items[item_id].title} for item_id in item_ids],
         "bullets":resolved_bullets,"entries":[{"content_item_id":entry["content_item_id"],
             "bullet_ids":list(entry.get("bullet_ids",[]))} for entry in selected]}
-    if personal is not None:
-        snapshot["personal_information"]={"id":personal.id,**{
-            field:getattr(personal,field) for field in _PERSONAL_INFORMATION_FIELDS}}
     if proposal_payload is not None:
         snapshot["provenance"]={"proposal_id":proposal_id,"source_fingerprint":proposal_payload.get("source_fingerprint"),
             "prompt_version":proposal_payload.get("prompt_version"),"schema_version":proposal_payload.get("schema_version"),
