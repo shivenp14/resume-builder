@@ -6,6 +6,7 @@ are never silently changed by analysis or optimization.
 from datetime import datetime, timezone
 import copy, hashlib, json, re
 from pathlib import Path
+import threading
 from typing import Any, Literal
 import uuid
 from fastapi import FastAPI, Depends, HTTPException
@@ -27,11 +28,13 @@ from .services.matching import (
     WEAKLY_REPRESENTED_THRESHOLD,
     score_requirement,
 )
+from .services.backup import BackupError, create_backup as create_backup_archive, list_backups as list_backup_archives
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+OPERATION_BARRIER = threading.RLock()
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_foreign_keys(connection, _record):
@@ -904,9 +907,12 @@ def _apply_sqlite_integrity_migrations() -> None:
 
 _apply_sqlite_integrity_migrations()
 def db():
-    s=SessionLocal()
-    try: yield s
-    finally: s.close()
+    # Hold the barrier for the complete request, not just session creation,
+    # so a backup cannot race a route that mutates SQLite or generated paths.
+    with OPERATION_BARRIER:
+        s=SessionLocal()
+        try: yield s
+        finally: s.close()
 
 class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list); skill_ids:list[int]=Field(default_factory=list)
 class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None; skill_ids:list[int]|None=None
@@ -1081,6 +1087,15 @@ class SnapshotOut(APIOut):
     contact:dict[str,Any]; sections:list[dict[str,Any]]; content_items:list[dict[str,Any]]; bullets:list[dict[str,Any]]; entries:list[dict[str,Any]]; provenance:dict[str,Any]|None=None
 class GenerationOut(RevisionOut): proposal_id:int; latex_url:str; pdf_url:str
 class RenderOut(APIOut): latex:str
+class BackupOut(APIOut):
+    filename:str
+    backup_version:int
+    format_version:int
+    schema_version:str
+    created_at:datetime
+    size:int
+    sha256:str
+    artifact_count:int
 
 def _content_version_response(version: ContentItemVersion) -> dict[str,Any]:
     return {column.name:getattr(version,column.name) for column in ContentItemVersion.__table__.columns} | {
@@ -1097,6 +1112,49 @@ app.mount("/generated", StaticFiles(directory=GENERATED), name="generated")
 app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="checkpoints")
 @app.get("/health",response_model=HealthOut)
 def health(): return {"status":"ok"}
+
+
+def _active_database_path() -> Path:
+    """Resolve the database currently used by the SQLAlchemy engine."""
+    database = engine.url.database
+    if database and database != ":memory:":
+        path = Path(database)
+        return path if path.is_absolute() else Path.cwd() / path
+    return DB_PATH
+
+
+def _backup_root() -> Path:
+    return ROOT / "data" / "backups"
+
+
+@app.post("/backups", response_model=BackupOut, status_code=201)
+def create_backup_endpoint():
+    """Create a local, checksummed SQLite-and-artifacts backup.
+
+    The response contains metadata only. The archive remains on the local
+    machine under ``data/backups`` and is never streamed through this API.
+    """
+    with OPERATION_BARRIER:
+        try:
+            record = create_backup_archive(
+                database_path=_active_database_path(),
+                generated_root=GENERATED,
+                backup_root=_backup_root(),
+            )
+            return {key: value for key, value in record.items() if key != "path"}
+        except BackupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/backups", response_model=list[BackupOut])
+def list_backups_endpoint():
+    with OPERATION_BARRIER:
+        try:
+            return list_backup_archives(backup_root=_backup_root())
+        except BackupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.post("/content-items",response_model=ContentItemOut)
 def create_item(x:ItemIn,s:Session=Depends(db)):
     values=x.model_dump(); skill_ids=values.pop("skill_ids",[])
