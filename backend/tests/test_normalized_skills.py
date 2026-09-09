@@ -68,7 +68,13 @@ def test_content_relationship_resolves_alias_and_flows_into_context_and_snapshot
     # proposal run; a canonical snapshot exposes the stable relationship ID.
     snapshot = client.get(f"/applications/{application['id']}/snapshot").json()
     assert snapshot["entries"][0]["skill_ids"] == [skill["id"]]
-    assert snapshot["sections"][0]["entries"][0]["skill_names"] == ["Python"]
+    rendered_entry = next(
+        entry
+        for section in snapshot["sections"]
+        for entry in section["entries"]
+        if entry["content_item_id"] == item["id"]
+    )
+    assert rendered_entry["skill_names"] == ["Python"]
 
 
 def test_legacy_alias_and_tag_backfill_is_idempotent():
