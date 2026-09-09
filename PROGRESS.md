@@ -39,7 +39,7 @@ Updated: September 7, 2026
 - [ ] Add content and bullet version history
 - [x] Add claim provenance and supporting evidence
 - [x] Add archive restore and duplication
-- [ ] Add normalized skill relationships and aliases
+- [x] Add normalized skill relationships and aliases
 - [ ] Expand application metadata and status history
 - [ ] Add submitted-revision tracking
 - [ ] Add structured job requirements and evidence links
