@@ -773,9 +773,13 @@ def _apply_sqlite_integrity_migrations() -> None:
         ConfirmationMaterialization.__table__.create(connection, checkfirst=True)
         # A legacy SQLite table cannot gain a foreign key via ADD COLUMN.  A
         # table rebuild would risk user data, so install equivalent ownership
-        # guards instead.  Invalid legacy pointers are cleared before the
-        # guards are installed; the application remains intact and can be
-        # resubmitted explicitly through the validated API.
+        # guards instead.  Invalid legacy application/revision pointers are
+        # cleared before the guards are installed; the application remains
+        # intact and can be resubmitted explicitly through the validated API.
+        # Ownership triggers below additionally protect new confirmation and
+        # materialization writes.  Existing legacy confirmation rows are
+        # preserved as audit data; a later explicit edit must repair them
+        # through the validated application-scoped API.
         connection.execute(text("""
             UPDATE applications
             SET submitted_revision_id = NULL
@@ -855,6 +859,75 @@ def _apply_sqlite_integrity_migrations() -> None:
             )
             BEGIN
                 SELECT RAISE(ABORT, 'cannot reassign submitted revision');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS missing_confirmations_requirement_owner_insert_guard
+            BEFORE INSERT ON missing_confirmations
+            WHEN NEW.requirement_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM job_requirements AS r
+                WHERE r.id = NEW.requirement_id
+                  AND r.application_id = NEW.application_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'confirmation requirement must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS missing_confirmations_requirement_owner_update_guard
+            BEFORE UPDATE OF application_id, requirement_id ON missing_confirmations
+            WHEN NEW.requirement_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM job_requirements AS r
+                WHERE r.id = NEW.requirement_id
+                  AND r.application_id = NEW.application_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'confirmation requirement must belong to application');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS missing_confirmations_materialized_status_guard
+            BEFORE UPDATE OF status ON missing_confirmations
+            WHEN OLD.status = 'confirmed'
+              AND NEW.status != 'confirmed'
+              AND EXISTS (
+                  SELECT 1 FROM confirmation_materializations AS m
+                  WHERE m.confirmation_id = OLD.id
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'materialized confirmation cannot be demoted');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS confirmation_materializations_owner_insert_guard
+            BEFORE INSERT ON confirmation_materializations
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM missing_confirmations AS c
+                JOIN job_requirements AS r ON r.id = NEW.requirement_id
+                WHERE c.id = NEW.confirmation_id
+                  AND c.application_id = NEW.application_id
+                  AND c.requirement_id = NEW.requirement_id
+                  AND r.application_id = NEW.application_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'materialization sources must share application and requirement ownership');
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS confirmation_materializations_owner_update_guard
+            BEFORE UPDATE OF confirmation_id, application_id, requirement_id ON confirmation_materializations
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM missing_confirmations AS c
+                JOIN job_requirements AS r ON r.id = NEW.requirement_id
+                WHERE c.id = NEW.confirmation_id
+                  AND c.application_id = NEW.application_id
+                  AND c.requirement_id = NEW.requirement_id
+                  AND r.application_id = NEW.application_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'materialization sources must share application and requirement ownership');
             END
         """))
 
@@ -2334,6 +2407,24 @@ def _confirmation_response(confirmation:MissingConfirmation, s:Session) -> dict[
         "source_record":materializations[-1].get("source") if materializations else None,
     }
 
+def _guard_materialized_confirmation(
+    confirmation:MissingConfirmation,
+    s:Session,
+    *,
+    status:str|None=None,
+    requirement_id:int|None=None,
+) -> None:
+    """Keep provenance immutable once a source record has been materialized."""
+    materialized=s.query(ConfirmationMaterialization.id).filter_by(
+        confirmation_id=confirmation.id
+    ).first()
+    if materialized is None:
+        return
+    if status is not None and status != "confirmed":
+        raise HTTPException(409,"materialized confirmation cannot be demoted")
+    if requirement_id is not None and requirement_id != confirmation.requirement_id:
+        raise HTTPException(409,"materialized confirmation requirement cannot be changed")
+
 def _source_input_from_confirmation(
     *,
     context:dict[str,Any] | None = None,
@@ -2438,6 +2529,21 @@ def _source_payload_for_hash(source:SourceRecordIn, source_type:str) -> dict[str
 def _hash_payload(payload:dict[str,Any]) -> str:
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
 
+def _materialization_identity(
+    confirmation:MissingConfirmation,
+    source:SourceRecordIn,
+) -> tuple[str,str,str]:
+    """Return source type, payload hash, and normalized idempotency key."""
+    source_type=_materialization_type(source)
+    payload_hash=_hash_payload(_source_payload_for_hash(source,source_type))
+    requested_key=source.idempotency_key
+    if requested_key is not None:
+        requested_key=requested_key.strip()
+        if not requested_key or len(requested_key)>200:
+            raise HTTPException(422,"idempotency_key must be 1-200 characters")
+    key=requested_key or f"confirmed:{confirmation.id}:sha256:{payload_hash}"
+    return source_type,payload_hash,key
+
 def _materialize_confirmation(
     confirmation:MissingConfirmation,
     source:SourceRecordIn,
@@ -2457,15 +2563,8 @@ def _materialize_confirmation(
     if application is None:
         raise HTTPException(404,"application not found")
     requirement=_application_requirement(application.id,confirmation.requirement_id,s)
-    source_type=_materialization_type(source)
+    source_type,payload_hash,idempotency_key=_materialization_identity(confirmation,source)
     request_payload=_source_payload_for_hash(source,source_type)
-    payload_hash=_hash_payload(request_payload)
-    requested_key=source.idempotency_key
-    if requested_key is not None:
-        requested_key=requested_key.strip()
-        if not requested_key or len(requested_key)>200:
-            raise HTTPException(422,"idempotency_key must be 1-200 characters")
-    idempotency_key=requested_key or f"confirmed:{confirmation.id}:sha256:{payload_hash}"
     existing=s.query(ConfirmationMaterialization).filter_by(
         application_id=application.id,requirement_id=requirement.id,idempotency_key=idempotency_key
     ).first()
@@ -2545,6 +2644,11 @@ def _materialize_confirmation(
             item=s.get(ContentItem,content_item_id)
             if item is None: raise HTTPException(404,"source content item not found")
             if item.is_archived: raise HTTPException(409,"cannot use evidence from an archived content item")
+            # Preserve the referenced existing bullet on the materialization
+            # row.  Without this assignment the CHECK constraint sees a
+            # bullet-shaped request with no bullet_id and the route fails (or
+            # loses the source provenance on databases without that CHECK).
+            bullet_id=bullet.id
         else:
             text_value=source.text or source.bullet_text
             if not isinstance(text_value,str) or not text_value.strip():
@@ -2617,6 +2721,36 @@ def _materialize_confirmation(
     materialization.result_fingerprint=_verified_context(application,s)["source_fingerprint"]
     return materialization
 
+def _materialize_and_commit(
+    confirmation:MissingConfirmation,
+    source:SourceRecordIn,
+    s:Session,
+) -> ConfirmationMaterialization:
+    """Commit a materialization and turn uniqueness races into safe retries."""
+    try:
+        materialization=_materialize_confirmation(confirmation,source,s)
+        s.commit()
+    except IntegrityError as exc:
+        s.rollback()
+        # A concurrent request may have committed the same idempotency key
+        # while this transaction was creating its source row.  Return that
+        # durable result when the payload agrees; otherwise report a clear
+        # conflict instead of leaking a 500/SQL error.
+        try:
+            _,payload_hash,idempotency_key=_materialization_identity(confirmation,source)
+            existing=s.query(ConfirmationMaterialization).filter_by(
+                application_id=confirmation.application_id,
+                requirement_id=confirmation.requirement_id,
+                idempotency_key=idempotency_key,
+            ).first()
+        except HTTPException:
+            existing=None
+        if existing is not None and existing.payload_hash == payload_hash:
+            return existing
+        raise HTTPException(409,"source materialization conflicted; retry with the same idempotency key") from exc
+    s.refresh(materialization)
+    return materialization
+
 @app.post("/applications/{id}/missing-confirmations",response_model=list[ConfirmationOut])
 def create_confirmations(id:int,s:Session=Depends(db)):
     a=s.get(Application,id)
@@ -2667,6 +2801,8 @@ def confirm_alias(id:int, payload:ConfirmationDecisionIn, s:Session=Depends(db))
     decision=str(payload.decision or payload.status or 'unresolved').lower()
     status={'confirm':'confirmed','confirmed':'confirmed','reject':'rejected','rejected':'rejected'}.get(decision,'unresolved')
     o=s.query(MissingConfirmation).filter_by(application_id=id,requirement_id=requirement_id).first() if requirement_id is not None else s.query(MissingConfirmation).filter_by(application_id=id,requirement=req).first()
+    if o is not None:
+        _guard_materialized_confirmation(o,s,status=status,requirement_id=requirement_id)
     if not o:
         o=MissingConfirmation(application_id=id,requirement=req,requirement_id=requirement_id,status=status,context=body); s.add(o)
     else: o.status=status; o.context=body; o.requirement_id=requirement_id or o.requirement_id
@@ -2676,7 +2812,7 @@ def confirm_alias(id:int, payload:ConfirmationDecisionIn, s:Session=Depends(db))
         if has_source:
             source=_source_input_from_confirmation(context=payload.context,source=payload.source,
                 source_type=payload.source_type,idempotency_key=payload.idempotency_key)
-            _materialize_confirmation(o,source,s)
+            _materialize_and_commit(o,source,s)
         # A status-only confirmation is retained for clients that collect the
         # decision first and submit the typed source payload through the
         # dedicated materialization route afterward.
@@ -2690,6 +2826,7 @@ def update_confirmation(id:int,x:ConfirmationIn,s:Session=Depends(db)):
     o=s.get(MissingConfirmation,id)
     if not o: raise HTTPException(404,"confirmation not found")
     if x.status not in {'confirmed','rejected','unresolved'}: raise HTTPException(422,"invalid confirmation status")
+    _guard_materialized_confirmation(o,s,status=x.status,requirement_id=x.requirement_id)
     if x.requirement_id is not None:
         if not s.get(JobRequirement,x.requirement_id) or s.get(JobRequirement,x.requirement_id).application_id != o.application_id:
             raise HTTPException(422,"requirement does not belong to confirmation application")
@@ -2701,7 +2838,7 @@ def update_confirmation(id:int,x:ConfirmationIn,s:Session=Depends(db)):
         if has_source:
             source=_source_input_from_confirmation(context=x.context,source=x.source,
                 source_type=x.source_type,idempotency_key=x.idempotency_key)
-            _materialize_confirmation(o,source,s)
+            _materialize_and_commit(o,source,s)
         # Status-only confirmation remains valid; the dedicated materialize
         # endpoint performs the required typed-source validation later.
     s.commit(); s.refresh(o); return _confirmation_response(o,s)
@@ -2714,8 +2851,7 @@ def materialize_confirmation(id:int,x:SourceRecordIn,s:Session=Depends(db)):
     if confirmation.status != "confirmed":
         raise HTTPException(409,"confirm the missing requirement before materializing source data")
     source=_source_input_from_confirmation(source=x)
-    materialization=_materialize_confirmation(confirmation,source,s)
-    s.commit(); s.refresh(materialization)
+    materialization=_materialize_and_commit(confirmation,source,s)
     return _materialization_response(materialization,s)
 
 @app.post("/applications/{id}/missing-confirmations/{confirmation_id}/materialize",response_model=ConfirmationMaterializationOut)
@@ -2727,8 +2863,7 @@ def materialize_application_confirmation(id:int,confirmation_id:int,x:SourceReco
     if confirmation.status != "confirmed":
         raise HTTPException(409,"confirm the missing requirement before materializing source data")
     source=_source_input_from_confirmation(source=x)
-    materialization=_materialize_confirmation(confirmation,source,s)
-    s.commit(); s.refresh(materialization)
+    materialization=_materialize_and_commit(confirmation,source,s)
     return _materialization_response(materialization,s)
 
 @app.get("/missing-confirmations/{id}/materializations",response_model=list[ConfirmationMaterializationOut])

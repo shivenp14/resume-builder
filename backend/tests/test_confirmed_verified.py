@@ -1,6 +1,8 @@
 """Contracts for materializing confirmed requirements into verified sources."""
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from fastapi.testclient import TestClient
 
 from backend.app import main
@@ -34,11 +36,11 @@ def _application(client):
     confirmation = next(row for row in client.post(
         f"/applications/{application['id']}/missing-confirmations"
     ).json() if row["requirement_id"] == docker["id"])
-    return application, item, docker, confirmation
+    return application, item, bullet, docker, confirmation
 
 
 def test_confirmed_skill_is_verified_linked_and_idempotent(client):
-    application, _, docker, confirmation = _application(client)
+    application, _, _, docker, confirmation = _application(client)
     payload = {
         "requirement_id": docker["id"],
         "decision": "confirmed",
@@ -68,7 +70,7 @@ def test_confirmed_skill_is_verified_linked_and_idempotent(client):
 
 
 def test_confirmed_bullet_requires_facts_and_records_provenance(client):
-    application, item, docker, confirmation = _application(client)
+    application, item, _, docker, confirmation = _application(client)
     rejected = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
         "status": "confirmed",
         "context": {"source_type": "bullet", "content_item_id": item["id"], "text": "Used Docker"},
@@ -94,7 +96,7 @@ def test_confirmed_bullet_requires_facts_and_records_provenance(client):
 
 
 def test_materialization_rejects_cross_application_and_reused_key(client):
-    application, _, docker, confirmation = _application(client)
+    application, _, _, docker, confirmation = _application(client)
     first = client.post(f"/missing-confirmations/{confirmation['id']}/materialize", json={
         "source_type": "skill", "name": "Docker", "idempotency_key": "one",
     })
@@ -113,7 +115,7 @@ def test_materialization_rejects_cross_application_and_reused_key(client):
 
 
 def test_materialization_changes_verified_source_fingerprint(client):
-    application, _, docker, confirmation = _application(client)
+    application, _, _, docker, confirmation = _application(client)
     before = client.get(f"/applications/{application['id']}/snapshot").json()
     # The materialization is intentionally performed through the typed route
     # after an explicit confirmation decision.
@@ -125,3 +127,78 @@ def test_materialization_changes_verified_source_fingerprint(client):
     with main.SessionLocal() as session:
         app_record = session.get(main.Application, application["id"])
         assert main._verified_context(app_record, session)["confirmation_materializations"]
+
+
+def test_existing_bullet_materialization_persists_bullet_id(client):
+    application, item, bullet, docker, confirmation = _application(client)
+    assert client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "confirmed", "context": {},
+    }).status_code == 200
+    response = client.post(
+        f"/applications/{application['id']}/missing-confirmations/{confirmation['id']}/materialize",
+        json={"source_type": "bullet", "bullet_id": bullet["id"], "idempotency_key": "existing-bullet"},
+    )
+    assert response.status_code == 200, response.text
+    materialization = response.json()
+    assert materialization["bullet_id"] == bullet["id"]
+    assert materialization["source_id"] == bullet["id"]
+    with main.SessionLocal() as session:
+        row = session.query(main.ConfirmationMaterialization).filter_by(
+            id=materialization["id"]
+        ).one()
+        assert row.bullet_id == bullet["id"]
+
+
+def test_materialized_confirmation_cannot_be_demoted(client):
+    application, _, _, docker, confirmation = _application(client)
+    confirmed = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "confirmed", "context": {"source_type": "skill", "name": "Docker"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    demoted = client.patch(f"/missing-confirmations/{confirmation['id']}", json={
+        "status": "rejected", "context": {},
+    })
+    assert demoted.status_code == 409
+    alias_demoted = client.post(f"/applications/{application['id']}/confirmations", json={
+        "requirement_id": docker["id"], "decision": "reject",
+    })
+    assert alias_demoted.status_code == 409
+
+
+def test_legacy_confirmation_migration_installs_ownership_guards(tmp_path, monkeypatch):
+    legacy = create_engine(f"sqlite:///{tmp_path / 'legacy-confirmations.db'}")
+    with legacy.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE applications (id INTEGER PRIMARY KEY, company VARCHAR(200), position VARCHAR(200), job_description TEXT, status VARCHAR(30), base_resume_id INTEGER, created_at DATETIME, updated_at DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE missing_confirmations (id INTEGER PRIMARY KEY, application_id INTEGER, requirement TEXT, status VARCHAR(20), context JSON, created_at DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO applications (id, company, position, job_description, status) VALUES (1, 'One', 'Engineer', 'x', 'draft'), (2, 'Two', 'Engineer', 'x', 'draft')"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO missing_confirmations (id, application_id, requirement, status) VALUES (1, 1, 'legacy', 'unresolved')"
+        )
+    monkeypatch.setattr(main, "engine", legacy)
+    main._apply_sqlite_integrity_migrations()
+    with legacy.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("PRAGMA table_info(missing_confirmations)"))}
+        assert "requirement_id" in columns
+        connection.execute(text(
+            "INSERT INTO job_requirements (id, application_id, normalized_key, text, category, priority, is_active, created_at, updated_at) VALUES (10, 1, 'one', 'One', 'required', 'required', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), (20, 2, 'two', 'Two', 'required', 'required', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ))
+        with pytest.raises(IntegrityError):
+            connection.execute(text("UPDATE missing_confirmations SET requirement_id=20 WHERE id=1"))
+        connection.execute(text("UPDATE missing_confirmations SET requirement_id=10 WHERE id=1"))
+        with pytest.raises(IntegrityError):
+            connection.execute(text(
+                "INSERT INTO missing_confirmations (id, application_id, requirement, requirement_id, status) VALUES (2, 1, 'bad', 20, 'unresolved')"
+            ))
+        connection.execute(text(
+            "INSERT INTO skills (id, name, aliases, verified) VALUES (1, 'Docker', '[]', 1)"
+        ))
+        with pytest.raises(IntegrityError):
+            connection.execute(text(
+                "INSERT INTO confirmation_materializations (id, confirmation_id, application_id, requirement_id, source_type, skill_id, idempotency_key, payload_hash, source_fingerprint, source_payload, created_at) VALUES (1, 1, 2, 10, 'skill', 1, 'bad', 'hash', 'fingerprint', '{}', CURRENT_TIMESTAMP)"
+            ))
