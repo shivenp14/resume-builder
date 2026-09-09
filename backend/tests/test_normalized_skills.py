@@ -25,6 +25,7 @@ def test_aliases_are_normalized_and_collisions_are_rejected():
     assert client.post("/skills", json={"name": "C#"}).status_code == 200
 
     assert normalize_skill_name(" PY ") == "py"
+    assert normalize_skill_name("Node.js") == normalize_skill_name("node js")
     assert normalize_skill_name("C++") != normalize_skill_name("C#")
 
 
@@ -84,3 +85,57 @@ def test_legacy_alias_and_tag_backfill_is_idempotent():
         assert session.query(ContentItemSkill).filter_by(
             content_item_id=item.id, skill_id=skill.id
         ).count() == 1
+
+
+def test_legacy_alias_collision_is_preserved_but_not_normalized_to_two_owners():
+    with main.SessionLocal() as session:
+        first = Skill(name="Python", aliases=["py"], verified=True)
+        second = Skill(name="PyTorch", aliases=["py"], verified=True)
+        session.add_all([first, second])
+        session.commit()
+
+    main._apply_sqlite_integrity_migrations()
+
+    with main.SessionLocal() as session:
+        first = session.get(Skill, first.id)
+        second = session.get(Skill, second.id)
+        assert first.aliases == ["py"]
+        assert second.aliases == ["py"]
+        assert session.query(SkillAlias).filter_by(normalized_name="py").count() == 1
+
+
+def test_unverified_source_relationship_is_excluded_from_snapshot_and_fingerprint():
+    unverified = client.post("/skills", json={"name": "Docker"}).json()
+    item = client.post(
+        "/content-items", json={"type": "experience", "title": "Builder"}
+    ).json()
+    assert client.post(
+        f"/content-items/{item['id']}/skills", json={"skill_id": unverified["id"]}
+    ).status_code == 200
+    resume = client.post("/base-resumes", json={"name": "Base"}).json()
+    assert client.post(
+        f"/base-resumes/{resume['id']}/entries",
+        json={"content_item_id": item["id"]},
+    ).status_code == 200
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example",
+            "position": "Engineer",
+            "job_description": "Python developer",
+            "base_resume_id": resume["id"],
+        },
+    ).json()
+
+    with main.SessionLocal() as session:
+        app_record = session.get(main.Application, application["id"])
+        context = main._verified_context(app_record, session)
+        assert context["verified_library"]["source_skills"] == []
+        assert context["base_snapshot"]["entries"][0]["skill_ids"] == []
+        fingerprint = context["source_fingerprint"]
+        link = session.query(ContentItemSkill).filter_by(
+            content_item_id=item["id"], skill_id=unverified["id"]
+        ).one()
+        link.source = "imported"
+        session.commit()
+        assert main._verified_context(app_record, session)["source_fingerprint"] == fingerprint

@@ -252,6 +252,7 @@ def _skill_for_name(value: object, s: Session) -> Skill | None:
 def _sync_skill_aliases(s: Session, skill: Skill, aliases: list[str], *, strict: bool) -> list[str]:
     """Validate and persist aliases in both normalized and legacy storage."""
 
+    legacy_aliases = list(aliases)
     try:
         canonical_key = normalize_skill_name(skill.name)
     except SkillNormalizationError as exc:
@@ -280,7 +281,13 @@ def _sync_skill_aliases(s: Session, skill: Skill, aliases: list[str], *, strict:
             continue
         for other in s.query(Skill).filter(Skill.id != skill.id).all():
             other_keys: set[str] = set()
-            for other_value in [other.name, *(other.aliases or [])]:
+            # During compatibility backfill, later legacy aliases are not
+            # owners yet; the deterministic first row should claim the
+            # normalized alias and later rows should retain their JSON value
+            # without creating an ambiguous normalized relationship.  Strict
+            # API writes inspect both canonical names and legacy aliases.
+            other_values = [other.name, *(other.aliases or [])] if strict else [other.name]
+            for other_value in other_values:
                 try:
                     other_keys.add(normalize_skill_name(other_value))
                 except SkillNormalizationError:
@@ -305,9 +312,12 @@ def _sync_skill_aliases(s: Session, skill: Skill, aliases: list[str], *, strict:
     for row in s.query(SkillAlias).filter_by(skill_id=skill.id).all():
         if row.normalized_name not in desired_keys:
             s.delete(row)
-    # Keep old API/database consumers working.  This list is deterministic and
-    # contains the display spelling rather than opaque normalized keys.
-    skill.aliases = cleaned
+    # Keep old API/database consumers working.  A compatibility migration must
+    # never erase a legacy value merely because a second skill owns its
+    # normalized spelling; the unresolved JSON value remains visible while the
+    # normalized relationship is safely omitted.  API writes are strict and
+    # receive the deterministic de-duplicated display list.
+    skill.aliases = cleaned if strict else legacy_aliases
     return cleaned
 
 
@@ -1465,9 +1475,14 @@ def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,propo
     item_ids=[entry["content_item_id"] for entry in selected]
     items={item.id:item for item in s.query(ContentItem).filter(ContentItem.id.in_(item_ids)).all()} if item_ids else {}
     item_skill_links=_item_skill_links(item_ids,s)
+    # Tailored snapshots and their source fingerprints are based only on
+    # verified source claims.  An unverified relationship remains available
+    # for later review/matching, but cannot silently alter an immutable resume
+    # or make an already-generated proposal stale.
+    linked_ids={link.skill_id for links in item_skill_links.values() for link in links}
     related_skills={skill.id:skill for skill in s.query(Skill).filter(
-        Skill.id.in_({link.skill_id for links in item_skill_links.values() for link in links})
-    ).all()} if item_ids else {}
+        Skill.id.in_(linked_ids), Skill.verified.is_(True)
+    ).all()} if linked_ids else {}
     requested_bullets=[bid for entry in selected for bid in entry.get("bullet_ids",[])]
     bullets={bullet.id:bullet for bullet in s.query(Bullet).filter(Bullet.id.in_(requested_bullets)).all()} if requested_bullets else {}
     changes={change["bullet_id"]:change for change in (proposal_payload or {}).get("bullet_changes",[])}
