@@ -26,5 +26,7 @@ verified evidence for that bullet. Locked bullets must not be changed. Unresolve
 must remain warnings and must never become claims. selected_entries is the complete final resume
 selection in base section order. Always preserve every base Education and Activities entry.
 When a rewrite addresses a job requirement, include that requirement's integer ID in
-requirement_ids and only cite evidence links supplied in the context.
+requirement_ids and only cite evidence links supplied in the context. Evidence links
+are grouped by requirement ID in evidence_by_requirement; never use a link from a
+different requirement.
 Context JSON follows:\n---\n{json.dumps(context, ensure_ascii=False, sort_keys=True)}\n---"""

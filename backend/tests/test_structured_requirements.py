@@ -91,6 +91,78 @@ def test_comparison_confirmations_and_proposal_context_use_requirement_ids(clien
     assert generated.status_code == 200
     assert any(row["requirement_id"] == docker["requirement_id"] for row in seen["requirements"])
     assert seen["confirmations"][0]["requirement_id"] == docker["requirement_id"]
+    python = next(row for row in seen["requirements"] if row["text"].casefold() == "python")
+    assert str(python["requirement_id"]) in seen["evidence_by_requirement"]
+
+
+def test_proposal_rejects_evidence_from_a_different_requirement(client):
+    application, _, _, _ = _application(client)
+    client.post(f"/applications/{application['id']}/analyze")
+    requirements = client.get(f"/applications/{application['id']}/requirements").json()
+    python = next(row for row in requirements if row["text"].casefold() == "python")
+    docker = next(row for row in requirements if row["text"].casefold() == "docker")
+    evidence_id = python["evidence_links"][0]["id"]
+    response = client.post(f"/applications/{application['id']}/proposals", json={
+        "payload": {"requirement_evidence": [{
+            "requirement_id": docker["id"], "evidence_ids": [evidence_id],
+        }]},
+    })
+    assert response.status_code == 422
+    assert "does not belong" in response.json()["detail"]
+
+
+def test_evidence_projection_changes_stale_existing_proposal(client):
+    application, _, _, _ = _application(client)
+    client.post(f"/applications/{application['id']}/analyze")
+    proposal = client.post(f"/applications/{application['id']}/proposals", json={
+        "payload": {"selected_entries": [], "bullet_changes": []},
+    }).json()
+    with main.SessionLocal() as session:
+        link = session.query(main.RequirementEvidenceLink).first()
+        link.note = "edited evidence note"
+        session.commit()
+    approved = client.post(f"/proposals/{proposal['id']}/approve")
+    assert approved.status_code == 409
+    assert "source data changed" in approved.json()["detail"]
+
+
+def test_old_analysis_replay_does_not_reactivate_superseded_requirements(client, monkeypatch):
+    application, _, _, _ = _application(client)
+    outputs = iter([
+        {"schema_version": "1.0", "requirements": ["Python"], "keywords": [],
+         "technologies": ["python"], "responsibilities": [], "preferred_qualifications": []},
+        {"schema_version": "1.0", "requirements": ["Docker"], "keywords": [],
+         "technologies": ["docker"], "responsibilities": [], "preferred_qualifications": []},
+    ])
+    class Provider:
+        def analyze(self, _):
+            return next(outputs)
+    monkeypatch.setattr(main, "_provider", lambda: Provider())
+    first = client.post(f"/applications/{application['id']}/analyze", json={"idempotency_key": "first"}).json()
+    first_id = first["requirements"][0]["id"]
+    client.post(f"/applications/{application['id']}/analyze", json={"idempotency_key": "second"})
+    with main.SessionLocal() as session:
+        row = session.get(main.JobRequirement, first_id)
+        assert row.text == "Python" and row.is_active is False
+    replay = client.post(f"/applications/{application['id']}/analyze", json={"idempotency_key": "first"})
+    assert replay.status_code == 200
+    with main.SessionLocal() as session:
+        row = session.get(main.JobRequirement, first_id)
+        assert row.text == "Python" and row.is_active is False
+
+
+def test_v1_provider_output_is_normalized_to_structured_requirements(client, monkeypatch):
+    application, _, _, _ = _application(client)
+    class Provider:
+        def analyze(self, _):
+            return {"schema_version": "1.0", "requirements": ["Python"],
+                    "keywords": ["python"], "technologies": ["python"],
+                    "responsibilities": [], "preferred_qualifications": []}
+    monkeypatch.setattr(main, "_provider", lambda: Provider())
+    result = client.post(f"/applications/{application['id']}/analyze").json()
+    assert result["schema_version"] == "2.0"
+    assert result["requirements"][0]["text"] == "Python"
+    assert result["requirements"][0]["requirement_id"] == result["requirements"][0]["id"]
 
 
 def test_requirement_backfill_is_safe_and_idempotent(client):

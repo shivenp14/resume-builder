@@ -380,16 +380,38 @@ def _upsert_requirement(s: Session, application_id: int, payload: dict[str,Any])
     s.flush()
     return requirement
 
-def _analysis_requirement_rows(analysis: JobAnalysis, s: Session) -> list[JobRequirement]:
-    """Return durable rows for an analysis, backfilling an old row if needed."""
+def _analysis_requirement_rows(analysis: JobAnalysis, s: Session, *, reactivate: bool = False) -> list[JobRequirement]:
+    """Return durable rows for an analysis without replaying stale mutations.
+
+    Reads default to ``reactivate=False`` so an older audit analysis can never
+    re-enable or overwrite a requirement superseded by a later analysis.
+    Migration code may opt into backfilling missing legacy rows, while fresh
+    analysis writes upsert their own normalized rows explicitly.
+    """
     rows: list[JobRequirement] = []
     values = analysis.requirements if isinstance(analysis.requirements, list) else []
     for raw in values:
+        raw_id = raw.get("id") or raw.get("requirement_id") if isinstance(raw, dict) else None
+        if raw_id is not None:
+            try:
+                requirement = s.get(JobRequirement, int(raw_id))
+            except (TypeError, ValueError):
+                requirement = None
+            if requirement is not None and requirement.application_id == analysis.application_id:
+                rows.append(requirement)
+                continue
         payload = _requirement_payload(raw)
         if payload is None:
             continue
-        requirement = _upsert_requirement(s, analysis.application_id, payload)
-        rows.append(requirement)
+        requirement = s.query(JobRequirement).filter_by(
+            application_id=analysis.application_id, normalized_key=payload["normalized_key"]
+        ).first()
+        if requirement is None and reactivate:
+            requirement = _upsert_requirement(s, analysis.application_id, payload)
+        if requirement is not None:
+            if reactivate:
+                requirement = _upsert_requirement(s, analysis.application_id, payload)
+            rows.append(requirement)
     # A legacy analysis may have no structured ``requirements`` but still has
     # technology output.  Those technologies are useful stable requirements
     # for comparison and confirmation routes.
@@ -397,12 +419,20 @@ def _analysis_requirement_rows(analysis: JobAnalysis, s: Session) -> list[JobReq
     for technology in analysis.technologies or []:
         payload = _requirement_payload(technology, category="technology")
         if payload and payload["normalized_key"] not in existing_keys:
-            rows.append(_upsert_requirement(s, analysis.application_id, payload))
-            existing_keys.add(payload["normalized_key"])
+            requirement = s.query(JobRequirement).filter_by(
+                application_id=analysis.application_id, normalized_key=payload["normalized_key"]
+            ).first()
+            if requirement is None and reactivate:
+                requirement = _upsert_requirement(s, analysis.application_id, payload)
+            if requirement is not None:
+                if reactivate:
+                    requirement = _upsert_requirement(s, analysis.application_id, payload)
+                rows.append(requirement)
+                existing_keys.add(payload["normalized_key"])
     return rows
 
 def _analysis_response(analysis: JobAnalysis, s: Session) -> dict[str,Any]:
-    rows = _analysis_requirement_rows(analysis, s)
+    rows = _analysis_requirement_rows(analysis, s, reactivate=False)
     return {
         "id": analysis.id,
         "application_id": analysis.application_id,
@@ -813,9 +843,16 @@ def _apply_sqlite_integrity_migrations() -> None:
         _backfill_legacy_contacts(session)
         # Backfill normalized requirement rows from legacy JSON analyses.  The
         # normalized key and unique index make this safe across repeated
-        # startups and preserve the same integer id on re-analysis.
-        for analysis in session.query(JobAnalysis).order_by(JobAnalysis.id).all():
-            rows = _analysis_requirement_rows(analysis, session)
+        # startups and preserve the same integer id on re-analysis.  Legacy
+        # analyses are immutable audit records: only the newest analysis for
+        # each application may leave its rows active.  In particular, replaying
+        # an older analysis during migration must not reactivate a superseded
+        # requirement.
+        analyses = session.query(JobAnalysis).order_by(JobAnalysis.id).all()
+        latest_by_application = {analysis.application_id: analysis for analysis in analyses}
+        latest_rows_by_application: dict[int, list[JobRequirement]] = {}
+        for analysis in analyses:
+            rows = _analysis_requirement_rows(analysis, session, reactivate=True)
             _sync_requirement_skill_evidence(session, rows, analysis.application_id)
             if rows:
                 analysis.requirements = [
@@ -824,8 +861,16 @@ def _apply_sqlite_integrity_migrations() -> None:
                      "source_text": row.source_text}
                     for row in rows
                 ]
+            if latest_by_application.get(analysis.application_id) is analysis:
+                latest_rows_by_application[analysis.application_id] = rows
             if not analysis.schema_version:
                 analysis.schema_version = "1.0"
+        for application_id, latest_rows in latest_rows_by_application.items():
+            session.query(JobRequirement).filter_by(application_id=application_id).update(
+                {"is_active": False}, synchronize_session=False
+            )
+            for row in latest_rows:
+                row.is_active = True
         # Existing text-keyed confirmation rows are linked only on an exact
         # normalized match.  Ambiguous or unmatched legacy rows remain intact.
         for confirmation in session.query(MissingConfirmation).filter(MissingConfirmation.requirement_id.is_(None)).all():
@@ -1717,22 +1762,78 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
     analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
-    requirement_rows=_analysis_requirement_rows(analysis,s) if analysis else []
+    requirement_rows=_analysis_requirement_rows(analysis,s,reactivate=False) if analysis else []
+    # Providers receive requirement-scoped links with stable source
+    # identifiers, types, and any human context attached to the link. The
+    # complete local projection is hashed below for freshness as well.
+    evidence_by_requirement={
+        str(row.id): [{
+            "id": link.id,
+            "requirement_id": link.requirement_id,
+            "source_type": link.source_type,
+            "source_id": link.source_id,
+            "content_item_id": link.content_item_id,
+            "bullet_id": link.bullet_id,
+            "skill_id": link.skill_id,
+            "excerpt": link.excerpt,
+            "note": link.note,
+        } for link in s.query(RequirementEvidenceLink).filter_by(
+            requirement_id=row.id
+        ).order_by(RequirementEvidenceLink.id).all()]
+        for row in requirement_rows
+    }
     source["requirements"]= [{
         "id": row.id, "requirement_id": row.id, "key": row.normalized_key,
         "requirement_key": row.normalized_key, "stable_id": row.normalized_key, "text": row.text, "category": row.category,
         "requirement_type": row.category, "priority": row.priority,
+        "source_text": row.source_text, "is_active": bool(row.is_active),
         "evidence_ids": [link.id for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=row.id).order_by(RequirementEvidenceLink.id).all()],
+    } for row in requirement_rows]
+    # Keep provider-facing requirement records compact, but hash every durable
+    # requirement column so edits to identity, source text, activation state,
+    # or audit timestamps invalidate an already-generated proposal.
+    source["requirement_projection"] = [{
+        "id": row.id,
+        "application_id": row.application_id,
+        "normalized_key": row.normalized_key,
+        "text": row.text,
+        "category": row.category,
+        "priority": row.priority,
+        "source_text": row.source_text,
+        "is_active": bool(row.is_active),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
     } for row in requirement_rows]
     source["requirement_evidence_ids"] = [
         link.id for row in requirement_rows
         for link in s.query(RequirementEvidenceLink).filter_by(requirement_id=row.id).order_by(RequirementEvidenceLink.id).all()
     ]
+    source["evidence_by_requirement"] = evidence_by_requirement
+    source["requirement_evidence"] = evidence_by_requirement
+    source["requirement_evidence_projection"] = {
+        str(row.id): [{
+            "id": link.id,
+            "requirement_id": link.requirement_id,
+            "source_type": link.source_type,
+            "source_id": link.source_id,
+            "content_item_id": link.content_item_id,
+            "bullet_id": link.bullet_id,
+            "skill_id": link.skill_id,
+            "excerpt": link.excerpt,
+            "note": link.note,
+            "created_at": link.created_at,
+        } for link in s.query(RequirementEvidenceLink).filter_by(
+            requirement_id=row.id
+        ).order_by(RequirementEvidenceLink.id).all()]
+        for row in requirement_rows
+    }
     fingerprint=hashlib.sha256(json.dumps(source,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
     base_snapshot=build_snapshot(a,s); base_snapshot.pop("contact",None)
     return {"base_snapshot":base_snapshot,"verified_library":verified,
         "requirements":source["requirements"],
         "requirement_evidence_ids":source["requirement_evidence_ids"],
+        "evidence_by_requirement":evidence_by_requirement,
+        "requirement_evidence":evidence_by_requirement,
         "source_fingerprint":fingerprint}
 
 def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fresh:bool=True) -> dict[str,Any]:
@@ -1740,7 +1841,10 @@ def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fr
     grounding={**context["verified_library"],"entries":[]}
     validate_proposal(payload,grounding)
     requirements={str(row["id"]):row for row in context.get("requirements",[])}
-    evidence_ids={str(evidence_id) for evidence_id in context.get("requirement_evidence_ids",[])}
+    evidence_by_requirement={
+        str(requirement_id): {str(link["id"]) for link in links}
+        for requirement_id, links in context.get("evidence_by_requirement",{}).items()
+    }
     for raw_id in payload.get("requirement_ids",[]):
         if str(raw_id) not in requirements:
             raise ValidationError("proposal references unknown requirement")
@@ -1753,8 +1857,8 @@ def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fr
         if raw_id not in requirements:
             raise ValidationError(f"proposal.requirement_evidence[{index}] references unknown requirement")
         for evidence_id in raw_link.get("evidence_ids",[]):
-            if str(evidence_id) not in evidence_ids:
-                raise ValidationError(f"proposal.requirement_evidence[{index}] references unknown evidence link")
+            if str(evidence_id) not in evidence_by_requirement.get(raw_id,set()):
+                raise ValidationError(f"proposal.requirement_evidence[{index}] evidence does not belong to requirement")
     owned:dict[int,set[int]]={item["id"]:set() for item in grounding["content_items"]}
     base_item_ids={entry["content_item_id"] for entry in context["base_snapshot"]["entries"]}
     for bullet in grounding["bullets"]: owned[bullet["content_item_id"]].add(bullet["id"])
@@ -1973,7 +2077,7 @@ def delete_requirement_evidence(link_id:int,s:Session=Depends(db)):
 def _comparison(a:Application,s:Session):
     analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
     if not analysis: raise HTTPException(404,"analyze application first")
-    rows=_analysis_requirement_rows(analysis,s)
+    rows=_analysis_requirement_rows(analysis,s,reactivate=False)
     # Technology terms retain the concise legacy comparison display (for
     # example ``docker``), while prose requirements remain structured rows.
     technology_rows=[row for row in rows if row.category == "technology"]
