@@ -95,6 +95,39 @@ def test_comparison_confirmations_and_proposal_context_use_requirement_ids(clien
     assert str(python["requirement_id"]) in seen["evidence_by_requirement"]
 
 
+def test_generated_proposal_persists_requirement_evidence_associations(client, monkeypatch):
+    from backend.app.services.llm_schemas import ProposalOutput
+
+    application, _, _, _ = _application(client)
+    client.post(f"/applications/{application['id']}/analyze")
+    python = next(row for row in client.get(f"/applications/{application['id']}/requirements").json()
+                  if row["text"].casefold() == "python")
+    evidence_id = python["evidence_links"][0]["id"]
+
+    class Provider:
+        def generate_proposal(self, context):
+            assert str(python["id"]) in context["evidence_by_requirement"]
+            return ProposalOutput(
+                selected_entries=[],
+                bullet_changes=[],
+                warnings=[],
+                rationale="",
+                requirement_ids=[python["id"]],
+                requirement_evidence=[{
+                    "requirement_id": python["id"],
+                    "evidence_ids": [evidence_id],
+                }],
+            )
+
+    monkeypatch.setattr(main, "_provider", lambda: Provider())
+    generated = client.post(f"/applications/{application['id']}/proposals/generate")
+    assert generated.status_code == 200
+    assert generated.json()["payload"]["requirement_evidence"] == [{
+        "requirement_id": python["id"],
+        "evidence_ids": [evidence_id],
+    }]
+
+
 def test_proposal_rejects_evidence_from_a_different_requirement(client):
     application, _, _, _ = _application(client)
     client.post(f"/applications/{application['id']}/analyze")

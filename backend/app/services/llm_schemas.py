@@ -45,6 +45,11 @@ class ProposalEntry(StrictModel):
             raise ValueError("proposal entry contains duplicate bullet IDs")
         return self
 
+class RequirementEvidenceOutput(StrictModel):
+    """Requirement-scoped evidence references emitted with a proposal."""
+    requirement_id: int
+    evidence_ids: list[int] = Field(default_factory=list)
+
 class ProposalOutput(StrictModel):
     schema_version: Literal["1.0", "2.0"] = SCHEMA_VERSION
     selected_entries: list[ProposalEntry] = Field(default_factory=list)
@@ -52,6 +57,7 @@ class ProposalOutput(StrictModel):
     warnings: list[str] = Field(default_factory=list)
     rationale: str = ""
     requirement_ids: list[int] = Field(default_factory=list)
+    requirement_evidence: list[RequirementEvidenceOutput] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def no_duplicate_selection_or_changes(self):

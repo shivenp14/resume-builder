@@ -112,10 +112,13 @@ def test_provider_command_pins_default_tier_and_strips_api_key(monkeypatch):
 
 def test_provider_schema_marks_every_property_required_for_codex():
     from backend.app.services.codex_provider import CodexProvider
-    from backend.app.services.llm_schemas import JobAnalysisOutput
+    from backend.app.services.llm_schemas import JobAnalysisOutput, ProposalOutput
 
     schema = CodexProvider._codex_schema(JobAnalysisOutput.model_json_schema())
     assert set(schema["required"]) == set(schema["properties"])
+    proposal_schema = CodexProvider._codex_schema(ProposalOutput.model_json_schema())
+    assert "requirement_evidence" in proposal_schema["properties"]
+    assert set(proposal_schema["required"]) == set(proposal_schema["properties"])
 
 
 def test_analysis_uses_fake_and_persists_audit_run(client, codex_backend):
