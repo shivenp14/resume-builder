@@ -37,7 +37,34 @@ and rendering every resume through the canonical baseline LaTeX template to
 PDF. The supplied baseline resume was a one-time curated initialization; a
 general PDF, DOCX, or pasted-text ingestion pipeline is out of scope.
 
-## Run the API
+## Run the frontend and API
+
+Install the frontend dependencies and create the backend virtual environment
+once:
+
+```bash
+npm install
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install -r backend/requirements.txt
+```
+
+Then start both services, with combined and labeled logs:
+
+```bash
+npm run dev
+```
+
+The frontend is available at `http://127.0.0.1:5173` and the API at
+`http://127.0.0.1:8000`. Press `Ctrl+C` to stop both services.
+
+To run either service separately:
+
+```bash
+npm run dev:frontend
+npm run dev:backend
+```
+
+## Run the API directly
 
 ```bash
 cd backend

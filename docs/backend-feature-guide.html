@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A developer guide to the Resume Builder backend feature wave.">
+  <title>Resume Builder · Backend feature guide</title>
+  <style>
+    :root{--ink:#15202b;--muted:#647487;--line:#d9e3eb;--paper:#fbfcfe;--panel:#f1f6fa;--blue:#205c96;--blue-soft:#e6f0fb;--teal:#0d776c;--teal-soft:#e5f5f2;--gold:#95620b;--gold-soft:#fff4db;--red:#a43f42;--shadow:0 10px 30px rgba(21,43,62,.08)}
+    *{box-sizing:border-box} html{scroll-behavior:smooth} body{margin:0;color:var(--ink);background:var(--paper);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .shell{max-width:1180px;margin:auto;padding:28px 24px 72px}.hero{position:relative;overflow:hidden;padding:42px 42px 38px;border:1px solid #c9dced;border-radius:18px;background:linear-gradient(135deg,#f4f9ff 0%,#fff 62%,#ecf8f5 100%);box-shadow:var(--shadow)}
+    .hero:after{content:"";position:absolute;width:260px;height:260px;right:-90px;top:-120px;border:38px solid rgba(32,92,150,.08);border-radius:50%}.eyebrow{font-size:.75rem;letter-spacing:.12em;text-transform:uppercase;color:var(--blue);font-weight:800}.hero h1{max-width:760px;margin:9px 0 12px;font-size:clamp(2.2rem,5vw,4.2rem);line-height:1.02;letter-spacing:-.06em}.hero p{max-width:760px;margin:0;color:#435568;font-size:1.08rem}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}.chip{padding:5px 10px;border-radius:999px;background:#fff;border:1px solid #cfdeea;color:#315875;font-size:.82rem;font-weight:700}
+    .layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:34px;margin-top:34px}.toc{position:sticky;top:18px;align-self:start;padding:15px;border:1px solid var(--line);border-radius:12px;background:#fff}.toc strong{display:block;margin:2px 7px 8px;font-size:.8rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}.toc a{display:block;padding:7px;border-radius:7px;color:#416078;text-decoration:none;font-size:.88rem}.toc a:hover{background:var(--blue-soft);color:var(--blue)}
+    section{scroll-margin-top:18px;margin-bottom:44px}h2{margin:0 0 13px;font-size:1.75rem;letter-spacing:-.035em}h3{margin:0 0 8px;font-size:1.03rem}h4{margin:17px 0 6px;font-size:.9rem;color:var(--blue)}p{margin:8px 0 13px}.lede{max-width:790px;color:#53677b;font-size:1rem}.note{padding:13px 15px;border-left:4px solid var(--teal);border-radius:8px;background:var(--teal-soft);color:#234e4b}.warning{border-left-color:var(--gold);background:var(--gold-soft);color:#60460f}
+    .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}.node{position:relative;min-height:108px;padding:14px;border:1px solid #c8d9e8;border-radius:11px;background:#fff;box-shadow:0 4px 12px rgba(26,55,79,.05)}.node:not(:last-child):after{content:"→";position:absolute;right:-17px;top:40px;color:var(--blue);font-size:1.35rem;font-weight:800;z-index:2}.node b{display:block;color:var(--blue);font-size:.85rem;margin-bottom:5px}.node small{color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:14px}.card{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:0 3px 12px rgba(21,43,62,.035)}.card .tag{display:inline-block;margin-bottom:10px;padding:3px 7px;border-radius:5px;background:var(--blue-soft);color:var(--blue);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.card p:last-child{margin-bottom:0}.feature{border-top:4px solid var(--blue)}
+    table{width:100%;border-collapse:collapse;margin:14px 0 20px;background:#fff;border:1px solid var(--line);border-radius:9px;overflow:hidden}th,td{text-align:left;vertical-align:top;padding:11px 12px;border-bottom:1px solid var(--line)}tr:last-child td{border-bottom:0}th{background:var(--panel);color:#385268;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}td:first-child{font-weight:700;color:#284b66}code{padding:2px 5px;border-radius:4px;background:#eef2f5;color:#273f51;font: .88em ui-monospace,SFMono-Regular,Menlo,monospace}pre{overflow:auto;margin:12px 0;padding:15px;border-radius:10px;background:#17232d;color:#dcecf3;font: .86rem/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.method{display:inline-block;min-width:47px;margin-right:4px;padding:2px 5px;border-radius:4px;background:#e6f2ff;color:#1e5d97;font:700 .72rem ui-monospace,monospace}.api{color:#385268;font: .9rem ui-monospace,monospace}
+    .schema{display:grid;grid-template-columns:repeat(3,1fr);gap:11px;margin:15px 0}.schema div{padding:13px;border:1px dashed #bbcfdf;border-radius:9px;background:#fff}.schema strong{display:block;margin-bottom:5px;color:var(--blue)}.schema span{display:block;color:var(--muted);font-size:.87rem}.badge{display:inline-block;margin-left:5px;padding:2px 6px;border-radius:4px;background:#e6f5ee;color:#17634e;font-size:.7rem;font-weight:800}.small{font-size:.88rem;color:var(--muted)}.kicker{color:var(--teal);font-weight:800}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}.callout{padding:17px;border:1px solid #d7e0e8;border-radius:11px;background:#fff}.callout h3{color:var(--teal)}
+    footer{padding-top:25px;border-top:1px solid var(--line);color:var(--muted);font-size:.88rem} @media(max-width:850px){.layout{grid-template-columns:1fr}.toc{position:static;display:flex;flex-wrap:wrap;gap:3px}.toc strong{width:100%}.flow{grid-template-columns:1fr 1fr}.node:not(:last-child):after{display:none}.schema,.two{grid-template-columns:1fr}} @media(max-width:500px){.shell{padding:14px 13px 50px}.hero{padding:28px 24px}.flow{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div class="eyebrow">Developer field guide · implementation wave complete</div>
+    <h1>What the new backend features actually do</h1>
+    <p>This is a code-grounded tour of the Resume Builder’s new source-of-truth, job-tailoring, revision, and backup capabilities. It is written for someone who needs to use the API or extend the backend without accidentally weakening provenance or immutability.</p>
+    <div class="chips"><span class="chip">FastAPI + SQLAlchemy</span><span class="chip">SQLite with FK enforcement</span><span class="chip">Codex proposals, never silent edits</span><span class="chip">Immutable revision snapshots</span><span class="chip">100 backend tests</span></div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="Guide sections"><strong>On this page</strong><a href="#mental-model">Mental model</a><a href="#source">Source library</a><a href="#applications">Applications</a><a href="#ai">Requirements & AI</a><a href="#revisions">Revisions</a><a href="#backup">Backup</a><a href="#routes">Route map</a><a href="#extend">Extension rules</a></nav>
+    <div>
+      <section id="mental-model">
+        <h2>The one mental model to keep</h2>
+        <p class="lede">The backend has two lanes. The <span class="kicker">verified source lane</span> is reusable, editable truth. The <span class="kicker">application lane</span> is job-specific analysis and proposals. A generated revision is the immutable bridge between them.</p>
+        <div class="flow" aria-label="Resume tailoring flow">
+          <div class="node"><b>1 · Source library</b><small>Profile, content, bullets, skills and evidence.</small></div>
+          <div class="node"><b>2 · Base resume</b><small>Select items and exact bullet IDs.</small></div>
+          <div class="node"><b>3 · Application</b><small>Job metadata, analysis, requirements.</small></div>
+          <div class="node"><b>4 · Proposal</b><small>Evidence-grounded suggestions for review.</small></div>
+          <div class="node"><b>5 · Revision</b><small>Canonical snapshot plus optional PDF.</small></div>
+        </div>
+        <div class="note"><strong>Safety boundary:</strong> analyzing a job or generating a proposal does not edit verified records. A user-approved proposal is revalidated against the current source fingerprint before it can produce a revision.</div>
+      </section>
+
+      <section id="source">
+        <h2>Source library: reusable truth</h2>
+        <p class="lede">These features make source data easier to reuse, audit, and connect to job requirements.</p>
+        <div class="grid">
+          <article class="card feature"><span class="tag">Personal profiles</span><h3>Typed personal-information records</h3><p><code>PersonalInformation</code> stores name, location, email, phone, LinkedIn, GitHub, website, summary, notes, and primary status. A <code>BaseResume.personal_information_id</code> points to the reusable record. Legacy <code>layout_settings.contact</code> remains readable and is backfilled once.</p><p class="small">Routes: <code>POST/GET /personal-information</code>, <code>GET/PATCH/DELETE /personal-information/{id}</code>. Compatibility aliases use <code>/personal-info</code>.</p></article>
+          <article class="card feature"><span class="tag">Audit trail</span><h3>Content and bullet history</h3><p><code>ContentItemVersion</code> and <code>BulletVersion</code> are append-only snapshots. Each create, edit, archive, and delete-related mutation records an action, version number, changed fields, and the prior data. History deliberately survives a later source-row removal.</p><p class="small">Routes: <code>GET /content-items/{id}/versions</code>, <code>GET /content-items/{id}/versions/{version}</code>, and the equivalent bullet routes. <code>/history</code> is a compatibility alias.</p></article>
+          <article class="card feature"><span class="tag">Lifecycle</span><h3>Archive, restore, duplicate</h3><p>Archiving hides a content item without destroying it. Restore clears <code>is_archived</code>. Duplication creates a new source item and copies its bullets, while preserving independent identity so later edits do not leak back to the original.</p><p class="small">Routes: <code>GET /content-items/archived</code>, <code>POST /content-items/{id}/restore</code>, <code>POST /content-items/{id}/duplicate</code>.</p></article>
+          <article class="card feature"><span class="tag">Canonical matching</span><h3>Normalized skills and aliases</h3><p><code>Skill</code> is the canonical verified concept. <code>SkillAlias</code> stores globally unique normalized alternate names. <code>ContentItemSkill</code> explicitly relates a source item to a skill, avoiding fragile free-text-only matching.</p><p class="small">Routes: <code>POST/GET /skills</code>, <code>POST/DELETE /skills/{id}/aliases/{alias}</code>, and <code>POST/GET/DELETE /content-items/{id}/skills</code>.</p></article>
+        </div>
+        <div class="schema"><div><strong>Editable source</strong><span>Profile → content item → bullet</span></div><div><strong>Normalized vocabulary</strong><span>Canonical skill ↔ alias ↔ content item</span></div><div><strong>Audit layer</strong><span>Every meaningful source mutation → immutable version</span></div></div>
+      </section>
+
+      <section id="applications">
+        <h2>Applications: lifecycle and submissions</h2>
+        <div class="two"><div class="callout"><h3>Richer job record</h3><p><code>Application</code> now supports source, location, employment type, salary range, contact name/email, deadline, notes, and applied/follow-up timestamps in addition to company, position, URL, description, status, and base-resume link.</p><p class="small">Create and update with <code>POST /applications</code> and <code>PATCH /applications/{id}</code>; query with <code>GET /applications</code> and <code>GET /applications/{id}</code>.</p></div><div class="callout"><h3>Append-only status history</h3><p>Status changes create <code>ApplicationStatusHistory</code> rows containing from-status, to-status, reason, and time. The current status remains on the application for fast filtering; the history is the audit trail.</p><p class="small">Routes: <code>POST /applications/{id}/status</code> and <code>GET /applications/{id}/status-history</code> (with <code>/history</code> alias).</p></div></div>
+        <h3>Submitted-revision tracking</h3><p>Submission is tied to the exact generated <code>Revision</code>, not merely the current source data. The backend validates that the revision belongs to the application and is submittable, then stores <code>submitted_revision_id</code> and <code>submitted_at</code>. Retrying through an alias route preserves the same association.</p>
+        <pre><code>POST /applications/42/submit
+{
+  "revision_id": 7,
+  "submitted_at": "2026-09-09T15:30:00Z"
+}
+
+GET /applications/42/submitted-revision
+// returns the immutable revision that was actually sent</code></pre>
+      </section>
+
+      <section id="ai">
+        <h2>Requirements, evidence, matching, and confirmation</h2>
+        <p class="lede">This is the most connected feature group. Stable requirement IDs and explicit evidence links let model output stay explainable and let deterministic code make the final safety decisions.</p>
+        <div class="grid">
+          <article class="card feature"><span class="tag">Structured analysis</span><h3>Durable job requirements</h3><p>Analysis output accepts legacy strings and new typed objects, then normalizes each requirement by a case/whitespace-insensitive key. <code>JobRequirement</code> rows are application-scoped and retain stable integer IDs across re-analysis when the requirement is unchanged.</p><p>Each row has text, category (<code>required</code>, <code>preferred</code>, <code>responsibility</code>, <code>technology</code>, <code>keyword</code>, or <code>other</code>), priority, source text, and active state.</p></article>
+          <article class="card feature"><span class="tag">Evidence graph</span><h3>Requirement evidence links</h3><p><code>RequirementEvidenceLink</code> points a requirement to a verified bullet, content item, or skill. Check constraints require a real source and one of the allowed source types. The API returns human context such as bullet text or skill name.</p><p class="small">Routes: <code>GET /applications/{id}/requirements</code>, <code>POST /applications/{id}/requirements/{requirement_id}/evidence</code>, <code>GET .../evidence</code>, <code>DELETE /requirement-evidence/{link_id}</code>.</p></article>
+          <article class="card feature"><span class="tag">Deterministic service</span><h3>Classifications and scoring</h3><p><code>services/matching.py</code> combines verified normalized skills, aliases, content-item relationships, selected base entries, bullet text, explicit evidence, and token overlap. It emits score, status, matched skills, evidence IDs, and human-readable signals. Base-resume evidence is stronger than library-only evidence; ambiguous aliases are not treated as proof.</p></article>
+          <article class="card feature"><span class="tag">Verified materialization</span><h3>Confirmed missing information → source</h3><p>A missing requirement can be confirmed first, then materialized as either a verified skill or a bullet in the shared source library. The <code>ConfirmationMaterialization</code> row records source type, source IDs, payload hash, source fingerprint, result fingerprint, and an idempotency key.</p><p class="small">Routes: <code>POST /applications/{id}/confirmations</code>, <code>POST /missing-confirmations/{id}/materialize</code>, and application-scoped materialization aliases.</p></article>
+        </div>
+        <h3>What the AI is allowed to do</h3>
+        <table><thead><tr><th>Stage</th><th>What happens</th><th>What cannot happen silently</th></tr></thead><tbody>
+          <tr><td><code>POST /applications/{id}/analyze</code></td><td>Codex extracts typed requirements, keywords, technologies, responsibilities, and preferred qualifications into a versioned analysis.</td><td>Analysis cannot rewrite source records.</td></tr>
+          <tr><td><code>POST /applications/{id}/proposals/generate</code></td><td>Codex selects existing entry/bullet IDs and proposes evidence-grounded rewrites, with requirement IDs and evidence links.</td><td>It cannot invent employers, dates, metrics, skills, or change locked bullets.</td></tr>
+          <tr><td><code>POST /proposals/{id}/approve</code></td><td>Validation rechecks source ownership, claims, duplicate IDs, locked bullets, requirement/evidence references, and source freshness.</td><td>A stale proposal is rejected instead of applied to newer data.</td></tr>
+          <tr><td><code>POST /applications/{id}/generate</code></td><td>An approved proposal is materialized into a canonical snapshot and rendered to revision-local LaTeX/PDF artifacts.</td><td>Unapproved or cross-application proposals cannot generate output.</td></tr>
+        </tbody></table>
+        <pre><code>POST /applications/42/requirements/9/evidence
+{
+  "source_type": "bullet",
+  "bullet_id": 31,
+  "excerpt": "Reduced build time by 40%",
+  "note": "Verified in project record"
+}</code></pre>
+      </section>
+
+      <section id="revisions">
+        <h2>Revisions and semantic comparison</h2>
+        <p>Every generated resume is stored as a JSON snapshot in <code>Revision.resume_json</code>, with a unique revision number per application. The snapshot is canonical: manual revision creation must match <code>build_snapshot</code>; a caller cannot smuggle arbitrary content into the immutable record.</p>
+        <div class="flow" aria-label="Revision flow"><div class="node"><b>Current source</b><small>Profile + selected entries + bullets.</small></div><div class="node"><b>Canonical snapshot</b><small>Validated contact, sections, entries, and provenance.</small></div><div class="node"><b>Revision row</b><small>Immutable numbered snapshot.</small></div><div class="node"><b>Rendered artifacts</b><small>TeX and PDF under generated/.</small></div><div class="node"><b>Compare</b><small>Ephemeral semantic diff.</small></div></div>
+        <p>The comparison service compares entries, bullets, ordering, contact, skills, and provenance semantically rather than diffing raw JSON formatting. It reports added, removed, changed, and reordered records without persisting a redundant diff.</p>
+        <pre><code>GET /applications/42/revisions/compare
+    ?from_revision_id=7&amp;to_revision_id=8
+
+// aliases also exist:
+GET /applications/42/revisions/7/compare/8
+GET /revisions/7/compare/8</code></pre>
+      </section>
+
+      <section id="backup">
+        <h2>Backup and export</h2>
+        <p><code>services/backup.py</code> creates a versioned, self-contained ZIP containing a SQLite online-backup snapshot, generated artifacts, and a manifest with size and SHA-256 checksums. It stages and validates the archive before publishing it.</p>
+        <div class="grid"><article class="card"><h3>Safe creation</h3><p>Uses SQLite’s online backup API, checks database and foreign-key integrity, rejects symlinks and paths outside the artifact root, and serializes version allocation for concurrent requests.</p></article><article class="card"><h3>Safe restore</h3><p>Validates member paths, format/schema, timestamps, limits, checksums, and SQLite integrity in a private staging directory. Only after validation does it replace live database/artifact content; failure restores the prior state.</p></article><article class="card"><h3>API</h3><p><code>POST /backups</code> creates an archive. <code>GET /backups</code> lists validated backup metadata. The service layer also exposes restore/manifest operations for controlled local workflows.</p></article></div>
+        <div class="note warning"><strong>Operational note:</strong> the backup includes generated PDFs/TeX as artifacts, but the authoritative data remains the database snapshot plus its integrity manifest. Treat the ZIP as a versioned local export, not as a public download.</div>
+      </section>
+
+      <section id="routes">
+        <h2>Compact route map</h2>
+        <table><thead><tr><th>Area</th><th>Primary routes</th><th>Core records/services</th></tr></thead><tbody>
+          <tr><td>Profiles</td><td><span class="method">POST</span><span class="api">/personal-information</span><br><span class="method">PATCH</span><span class="api">/personal-information/{id}</span></td><td><code>PersonalInformation</code>, legacy contact migration</td></tr>
+          <tr><td>History</td><td><span class="method">GET</span><span class="api">/content-items/{id}/versions</span><br><span class="method">GET</span><span class="api">/bullets/{id}/versions</span></td><td><code>ContentItemVersion</code>, <code>BulletVersion</code></td></tr>
+          <tr><td>Source lifecycle</td><td><span class="method">POST</span><span class="api">/content-items/{id}/restore</span><br><span class="method">POST</span><span class="api">/content-items/{id}/duplicate</span></td><td><code>ContentItem</code>, <code>Bullet</code></td></tr>
+          <tr><td>Skills</td><td><span class="method">POST</span><span class="api">/skills/{id}/aliases</span><br><span class="method">POST</span><span class="api">/content-items/{id}/skills</span></td><td><code>SkillAlias</code>, <code>ContentItemSkill</code></td></tr>
+          <tr><td>Applications</td><td><span class="method">POST</span><span class="api">/applications/{id}/status</span><br><span class="method">POST</span><span class="api">/applications/{id}/submit</span></td><td><code>ApplicationStatusHistory</code>, submitted revision link</td></tr>
+          <tr><td>Tailoring</td><td><span class="method">POST</span><span class="api">/applications/{id}/analyze</span><br><span class="method">POST</span><span class="api">/applications/{id}/proposals/generate</span></td><td><code>JobRequirement</code>, evidence links, proposals, matching service</td></tr>
+          <tr><td>Confirmations</td><td><span class="method">PATCH</span><span class="api">/missing-confirmations/{id}</span><br><span class="method">POST</span><span class="api">/missing-confirmations/{id}/materialize</span></td><td><code>MissingConfirmation</code>, <code>ConfirmationMaterialization</code></td></tr>
+          <tr><td>Output</td><td><span class="method">GET</span><span class="api">/applications/{id}/revisions/compare</span><br><span class="method">POST</span><span class="api">/backups</span></td><td><code>Revision</code>, comparison and backup services</td></tr>
+        </tbody></table>
+      </section>
+
+      <section id="extend">
+        <h2>Extension rules for future work</h2>
+        <div class="grid"><article class="card"><h3>Preserve the lanes</h3><p>Put reusable truth in source tables. Put job-specific assertions in application tables. Keep the boundary explicit with foreign keys, fingerprints, and provenance.</p></article><article class="card"><h3>Prefer additive migrations</h3><p>Existing JSON fields and route aliases support rolling upgrades. New durable concepts should get typed tables and stable IDs rather than another nested JSON convention.</p></article><article class="card"><h3>Make retries safe</h3><p>Use unique constraints and idempotency keys for materialization, backup versioning, and other side effects. A retry should return the same logical result or a clear conflict.</p></article><article class="card"><h3>Test the negative path</h3><p>Cross-application references, stale proposals, locked bullets, ambiguous aliases, unsafe archive paths, tampered backups, and invalid evidence are first-class behaviors, not edge cases.</p></article></div>
+        <p class="small" style="margin-top:18px">Implementation anchors: <code>backend/app/main.py</code> for models/routes/orchestration; <code>services/matching.py</code>, <code>revision_comparison.py</code>, and <code>backup.py</code> for extracted logic; <code>services/llm_schemas.py</code>, <code>llm_prompts.py</code>, and <code>validation.py</code> for AI contracts and safety.</p>
+      </section>
+      <footer>Generated from the current repository implementation and <code>PROGRESS.md</code>. The guide is standalone and intentionally has no runtime dependencies.</footer>
+    </div>
+  </div>
+</main>
+</body>
+</html>

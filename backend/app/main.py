@@ -10,6 +10,7 @@ import threading
 from typing import Any, Literal
 import uuid
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
 from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, CheckConstraint, event, func, or_, text, inspect
@@ -34,7 +35,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "app.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
-OPERATION_BARRIER = threading.RLock()
+# FastAPI may enter and clean up a synchronous yield dependency on different
+# worker threads. A Lock is intentionally not thread-owner-bound, unlike RLock.
+OPERATION_BARRIER = threading.Lock()
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_foreign_keys(connection, _record):
@@ -1304,6 +1307,16 @@ def _bullet_version_response(version: BulletVersion) -> dict[str,Any]:
         "version":version.version_number}
 
 app=FastAPI(title="Resume Builder API",version="0.1.0")
+# The local Vite workspace is served on a separate origin during development.
+# Keep this explicit so browser requests retain the same backend validation and
+# provenance rules as direct API clients.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 GENERATED = ROOT / "generated"
 GENERATED.mkdir(exist_ok=True)
 app.mount("/generated", StaticFiles(directory=GENERATED), name="generated")

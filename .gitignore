@@ -31,3 +31,7 @@ checkpoints/
 .DS_Store
 .vscode/*
 !.vscode/settings.json
+
+# Frontend dependencies and build output
+node_modules/
+dist/

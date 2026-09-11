@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gemini mockup — Resume notebook</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap');
+
+      :root {
+        --canvas: #f7f8f5;
+        --sidebar: #f2f5f0;
+        --forest: #27423d;
+        --ink: #243733;
+        --sage: #7daa91;
+        --sage-deep: #5f927d;
+        --body: #75827c;
+        --line: #e4ebe4;
+        --white: #ffffff;
+        --warm: #e7c7ac;
+        --soft-warm: #fbf5ef;
+        --radius: 18px;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-width: 1080px;
+        color: var(--ink);
+        background: var(--canvas);
+        font-family: "DM Sans", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      button { font: inherit; cursor: pointer; }
+      .app { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
+
+      .side {
+        display: flex;
+        flex-direction: column;
+        padding: 31px 18px 22px;
+        background: var(--sidebar);
+        border-right: 1px solid var(--line);
+      }
+      .brand { display: flex; align-items: center; gap: 10px; padding: 0 9px; margin-bottom: 47px; }
+      .mark { position: relative; width: 29px; height: 29px; border: 1.5px solid var(--forest); border-radius: 50% 50% 45% 50%; transform: rotate(-17deg); }
+      .mark::after { content: ""; position: absolute; width: 10px; height: 1.5px; background: var(--forest); border-radius: 2px; transform: rotate(37deg); left: 8px; top: 13px; }
+      .brand span { font-family: Fraunces, serif; font-size: 20px; letter-spacing: -.6px; }
+      .nav-label { padding: 0 10px; color: #92a098; font: 500 10px/1 "DM Mono", monospace; letter-spacing: .1em; text-transform: uppercase; }
+      .nav { display: grid; gap: 5px; margin-top: 12px; }
+      .nav a { display: flex; align-items: center; gap: 12px; height: 43px; padding: 0 10px; color: var(--body); border-radius: 12px; text-decoration: none; font-size: 14px; }
+      .nav a.active { color: var(--forest); background: rgba(255,255,255,.83); font-weight: 600; box-shadow: 0 1px 2px rgba(39,66,61,.025); }
+      .nav svg { width: 18px; stroke-width: 1.65; }
+      .nav .count { margin-left: auto; color: var(--sage-deep); font: 11px "DM Mono", monospace; }
+      .side-bottom { margin-top: auto; }
+      .quiet-note { padding: 15px; border: 1px solid #dde8de; border-radius: 15px; background: rgba(255,255,255,.45); }
+      .quiet-note .sprout { color: var(--sage-deep); font-size: 15px; }
+      .quiet-note p { margin: 8px 0 0; color: var(--body); font-size: 12px; line-height: 1.5; }
+      .person { display: flex; gap: 10px; align-items: center; padding: 20px 9px 0; }
+      .avatar { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; background: var(--warm); color: #7d5c48; font: 500 11px "DM Mono", monospace; }
+      .person b { display: block; font-size: 12px; font-weight: 600; }.person span { color: var(--body); font-size: 11px; }
+
+      main { max-width: 1440px; width: 100%; margin: 0 auto; padding: 32px 53px 50px; }
+      .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 36px; }
+      .crumb { color: var(--body); font-size: 13px; }.crumb b { color: var(--ink); font-weight: 600; }.crumb em { padding: 0 8px; font-style: normal; color: #b2bcb6; }
+      .top-actions { display: flex; gap: 11px; align-items: center; }
+      .icon-button { display: grid; place-items: center; width: 37px; height: 37px; color: var(--body); border: 1px solid var(--line); border-radius: 12px; background: var(--white); }
+      .icon-button svg { width: 17px; }
+      .new { border: 0; border-radius: 12px; padding: 11px 16px; color: white; background: var(--forest); font-size: 13px; font-weight: 600; box-shadow: 0 4px 9px rgba(39,66,61,.12); }
+
+      .welcome { display: flex; justify-content: space-between; align-items: end; margin-bottom: 29px; }
+      h1 { margin: 0; font: 600 38px/1.08 Fraunces, serif; letter-spacing: -1.5px; }
+      .welcome p { margin: 10px 0 0; color: var(--body); font-size: 14px; }
+      .date { color: var(--body); font: 11px "DM Mono", monospace; letter-spacing: .05em; text-transform: uppercase; }
+
+      .thread { display: grid; grid-template-columns: 1.1fr 1.45fr .85fr; gap: 1px; margin-bottom: 28px; overflow: hidden; border: 1px solid #dce6dd; border-radius: var(--radius); background: #dce6dd; }
+      .thread-part { min-height: 113px; padding: 21px 22px; background: var(--white); }
+      .thread-part.focus { position: relative; background: #f9fbf8; }.thread-part.focus::after { content: ""; position: absolute; width: 9px; height: 9px; top: 23px; right: 22px; border-radius: 50%; background: var(--sage); box-shadow: 0 0 0 5px #edf5ed; }
+      .eyebrow { color: var(--sage-deep); font: 500 10px "DM Mono", monospace; letter-spacing: .09em; text-transform: uppercase; }
+      .thread strong { display: block; margin-top: 10px; font-size: 15px; letter-spacing: -.2px; }.thread p { margin: 5px 0 0; color: var(--body); font-size: 12px; line-height: 1.45; }
+      .thread .next-link { display: inline-flex; margin-top: 9px; color: var(--forest); font-size: 12px; font-weight: 600; text-decoration: none; }
+      .number { color: var(--forest); font: 600 31px/.9 Fraunces, serif; }.number-label { margin-top: 8px; color: var(--body); font-size: 12px; }
+
+      .workspace { display: grid; grid-template-columns: minmax(490px, .96fr) minmax(390px, .74fr); gap: 28px; align-items: start; }
+      .section-head { display: flex; justify-content: space-between; align-items: center; padding: 3px 1px 13px; }
+      h2 { margin: 0; font-size: 14px; letter-spacing: -.15px; }.subtle-link { color: var(--sage-deep); font-size: 12px; text-decoration: none; font-weight: 600; }
+      .list { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--white); }
+      .application { display: grid; grid-template-columns: 42px 1fr auto; column-gap: 13px; align-items: center; padding: 17px 19px; border-bottom: 1px solid var(--line); }.application:last-child { border: 0; }
+      .company-mark { display: grid; place-items: center; width: 42px; height: 42px; color: var(--forest); border-radius: 13px; background: #eef3ed; font: 600 15px Fraunces, serif; }.company-mark.blue { background: #eff3f2; color: #526d70; }.company-mark.tan { background: #faf1e8; color: #986c50; }.company-mark.pale { background: #f3f2ed; color: #687c68; }
+      .app-name { font-size: 13px; font-weight: 600; }.role { margin-top: 3px; color: var(--body); font-size: 12px; }.app-meta { min-width: 109px; text-align: right; }.tag { display: inline-block; padding: 4px 8px; border-radius: 30px; color: var(--sage-deep); background: #eef5ef; font-size: 10px; font-weight: 600; }.tag.wait { color: #8b765e; background: #faf4eb; }.tag.draft { color: #708179; background: #f1f3f1; }.when { display: block; margin-top: 5px; color: #9aa69f; font-size: 10px; }
+
+      .resume-card { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--white); }
+      .paper { position: relative; min-height: 334px; margin: 17px; padding: 23px 27px; overflow: hidden; border: 1px solid #e7ece6; border-radius: 10px; background: #fff; box-shadow: 0 7px 22px rgba(36,55,51,.045); }.paper::after { content: ""; position: absolute; width: 145px; height: 145px; right: -65px; bottom: -80px; border: 18px solid #f0f5ef; border-radius: 50%; }
+      .paper-name { font: 600 20px Fraunces, serif; letter-spacing: -.5px; }.paper-contact { margin-top: 4px; color: #849089; font-size: 8px; }.paper-rule { height: 1px; margin: 13px 0 11px; background: #dfe7df; }.paper-heading { margin: 10px 0 5px; color: var(--forest); font: 500 8px "DM Mono", monospace; letter-spacing: .11em; }.paper-line { height: 5px; margin-bottom: 5px; border-radius: 9px; background: #e9eeea; }.paper-line.dark { background: #d8e3d9; }.paper-line.short { width: 61%; }.paper-line.medium { width: 79%; }.paper-job { display: flex; justify-content: space-between; margin: 7px 0 5px; font-size: 8px; font-weight: 600; }.paper-job span { color: #8a968e; font-weight: 400; }
+      .resume-foot { display: flex; justify-content: space-between; align-items: center; padding: 0 18px 17px; }.resume-foot span { color: var(--body); font-size: 11px; }.resume-foot button { padding: 8px 11px; color: var(--forest); border: 1px solid #d9e5da; border-radius: 9px; background: #f8fbf8; font-size: 11px; font-weight: 600; }
+
+      .soft-panel { margin-top: 18px; padding: 17px 18px; border: 1px solid #e0e8e0; border-radius: var(--radius); background: #f4f8f3; }.soft-panel-header { display: flex; align-items: center; justify-content: space-between; }.soft-panel strong { font-size: 13px; }.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); }.soft-panel p { margin: 8px 0 0; color: var(--body); font-size: 12px; line-height: 1.45; }
+      .soft-panel a { display: inline-block; margin-top: 11px; color: var(--forest); font-size: 11px; font-weight: 600; text-decoration: none; }
+      @media (max-width: 1120px) { main { padding: 28px 32px; }.workspace { grid-template-columns: 1fr .68fr; gap: 19px; }.thread-part { padding: 19px 17px; } }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="side">
+        <div class="brand"><i class="mark"></i><span>morrow</span></div>
+        <span class="nav-label">your space</span>
+        <nav class="nav">
+          <a class="active" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V10Z"/><path d="M9 21v-7h6v7"/></svg>Home</a>
+          <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>Applications <span class="count">04</span></a>
+          <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 3h12v18l-6-3-6 3V3Z"/></svg>Resume library</a>
+          <a href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 13c0 5-8 8-8 8s-8-3-8-8a8 8 0 1 1 16 0Z"/><circle cx="12" cy="13" r="2.5"/></svg>Notes</a>
+        </nav>
+        <div class="side-bottom">
+          <div class="quiet-note"><span class="sprout">⌇</span><p>Small steps count. Your work is safely kept here.</p></div>
+          <div class="person"><div class="avatar">SP</div><div><b>Shiven</b><span>Personal workspace</span></div></div>
+        </div>
+      </aside>
+      <main>
+        <header class="topbar"><div class="crumb"><b>Home</b><em>/</em> a quiet overview</div><div class="top-actions"><button class="icon-button" aria-label="Search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg></button><button class="new">Add an application</button></div></header>
+        <section class="welcome"><div><h1>Good morning, Shiven.</h1><p>Here’s a gentle place to pick up where you left off.</p></div><div class="date">Tuesday · September 9</div></section>
+        <section class="thread" aria-label="Today's thread">
+          <div class="thread-part focus"><span class="eyebrow">Today’s thread</span><strong>Make one resume feel ready</strong><p>Your Appian draft is waiting for a final read.</p></div>
+          <div class="thread-part"><span class="eyebrow">A quiet next step</span><strong>Review two suggestions for Appian</strong><p>They draw only from the experience you’ve already saved.</p><a class="next-link" href="#">Open suggestions&nbsp; →</a></div>
+          <div class="thread-part"><span class="number">4</span><div class="number-label">active applications<br>at your own pace</div></div>
+        </section>
+        <div class="workspace">
+          <section><div class="section-head"><h2>Applications in motion</h2><a class="subtle-link" href="#">See all</a></div><div class="list">
+            <article class="application"><div class="company-mark">A</div><div><div class="app-name">Appian</div><div class="role">Software Engineering Intern</div></div><div class="app-meta"><span class="tag">Ready to review</span><span class="when">touched today</span></div></article>
+            <article class="application"><div class="company-mark blue">B</div><div><div class="app-name">Bloomberg</div><div class="role">Data Engineering Intern</div></div><div class="app-meta"><span class="tag wait">Sent</span><span class="when">Aug 28</span></div></article>
+            <article class="application"><div class="company-mark tan">C</div><div><div class="app-name">Cedar</div><div class="role">Product Intern</div></div><div class="app-meta"><span class="tag draft">A new thought</span><span class="when">Sep 4</span></div></article>
+            <article class="application"><div class="company-mark pale">N</div><div><div class="app-name">Notion</div><div class="role">Software Engineer, University</div></div><div class="app-meta"><span class="tag draft">Saved for later</span><span class="when">Sep 1</span></div></article>
+          </div></section>
+          <section><div class="section-head"><h2>Your most recent resume</h2><a class="subtle-link" href="#">Library</a></div><div class="resume-card"><div class="paper"><div class="paper-name">Shiven Pandya</div><div class="paper-contact">New Jersey · shivenpandya.com · hello@shiven.dev</div><div class="paper-rule"></div><div class="paper-heading">Experience</div><div class="paper-job">Research Assistant <span>2025 — present</span></div><div class="paper-line dark medium"></div><div class="paper-line"></div><div class="paper-line short"></div><div class="paper-heading">Education</div><div class="paper-job">Stevens Institute of Technology <span>2023 — 2027</span></div><div class="paper-line medium"></div><div class="paper-heading">Selected work</div><div class="paper-line dark"></div><div class="paper-line medium"></div></div><div class="resume-foot"><span>Baseline · 1 page</span><button>Open resume</button></div></div><div class="soft-panel"><div class="soft-panel-header"><strong>A note on your resume</strong><i class="pulse"></i></div><p>Everything you tailor stays connected to this original version. Nothing is overwritten.</p><a href="#">See revision history&nbsp; →</a></div></section>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "morrow-resume-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:frontend": "vite",
+    "dev:backend": "python3 -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {}
+}
