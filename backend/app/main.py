@@ -4,7 +4,7 @@ The API deliberately keeps AI output as proposals: source records and revisions
 are never silently changed by analysis or optimization.
 """
 from datetime import datetime, timezone
-import copy, hashlib, json, re
+import copy, hashlib, json, os, re, shutil, tempfile
 from pathlib import Path
 import threading
 from typing import Any, Literal
@@ -1053,12 +1053,12 @@ def _apply_sqlite_integrity_migrations() -> None:
 
 _apply_sqlite_integrity_migrations()
 def db():
-    # Hold the barrier for the complete request, not just session creation,
-    # so a backup cannot race a route that mutates SQLite or generated paths.
-    with OPERATION_BARRIER:
-        s=SessionLocal()
-        try: yield s
-        finally: s.close()
+    # A database session belongs to one request, but it must not serialize the
+    # request.  Analysis and generation deliberately perform provider/compiler
+    # work after committing and closing their initial transaction below.
+    s=SessionLocal()
+    try: yield s
+    finally: s.close()
 
 class ItemIn(BaseModel): type:str; title:str; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]=Field(default_factory=list); skill_ids:list[int]=Field(default_factory=list)
 class ItemPatch(BaseModel): type:str|None=None; title:str|None=None; organization:str|None=None; location:str|None=None; start_date:str|None=None; end_date:str|None=None; summary:str|None=None; tags:list[str]|None=None; skill_ids:list[int]|None=None
@@ -2203,9 +2203,13 @@ def analyze(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)
         if prior and prior.status=="succeeded" and prior.output_payload:
             existing=s.get(JobAnalysis,prior.output_payload.get("id"))
             if existing: return _analysis_response(existing,s)
-    run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,input_payload={"job_description":a.job_description},model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+    job_description=a.job_description
+    run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,input_payload={"job_description":job_description},model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+    run_id=run.id
+    # Do not retain a SQLite transaction while the provider can take minutes.
+    s.close()
     try:
-        result=_provider_call(_provider(),"analysis",a.job_description)
+        result=_provider_call(_provider(),"analysis",job_description)
         if hasattr(result,"model_dump"): result=result.model_dump()
         if not isinstance(result,dict): raise ValueError("Codex returned invalid analysis")
         fields={k:list(result.get(k,[])) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")}
@@ -2230,25 +2234,30 @@ def analyze(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)
             payload=_requirement_payload(raw,category="technology")
             if payload and payload["normalized_key"] not in seen_keys:
                 normalized_requirements.append(payload); seen_keys.add(payload["normalized_key"])
-        o=JobAnalysis(application_id=id,requirements=normalized_requirements,
-            keywords=fields["keywords"],technologies=fields["technologies"],
-            responsibilities=fields["responsibilities"],preferred_qualifications=fields["preferred_qualifications"],
-            schema_version=SCHEMA_VERSION); s.add(o); s.flush()
-        s.query(JobRequirement).filter_by(application_id=id).update({"is_active":False}, synchronize_session=False)
-        rows=[]
-        for payload in normalized_requirements:
-            row=_upsert_requirement(s,id,payload); rows.append(row)
-        o.requirements=[{"id":row.id,"requirement_id":row.id,"key":row.normalized_key,
-            "text":row.text,"category":row.category,"priority":row.priority,
-            "source_text":row.source_text} for row in rows]
-        # A normalized skill relationship is verified source evidence. Link
-        # exact skill/alias mentions automatically, without inventing bullets
-        # or promoting unverified skills.
-        _sync_requirement_skill_evidence(s, rows, id)
-        run.status="succeeded"; run.output_payload={"id":o.id,**fields,
-            "requirements":[{"id":row.id,"text":row.text,"category":row.category} for row in rows]}; run.completed_at=now(); s.commit(); s.refresh(o); return _analysis_response(o,s)
+        with SessionLocal() as write_session:
+            o=JobAnalysis(application_id=id,requirements=normalized_requirements,
+                keywords=fields["keywords"],technologies=fields["technologies"],
+                responsibilities=fields["responsibilities"],preferred_qualifications=fields["preferred_qualifications"],
+                schema_version=SCHEMA_VERSION); write_session.add(o); write_session.flush()
+            write_session.query(JobRequirement).filter_by(application_id=id).update({"is_active":False}, synchronize_session=False)
+            rows=[]
+            for payload in normalized_requirements:
+                row=_upsert_requirement(write_session,id,payload); rows.append(row)
+            o.requirements=[{"id":row.id,"requirement_id":row.id,"key":row.normalized_key,
+                "text":row.text,"category":row.category,"priority":row.priority,
+                "source_text":row.source_text} for row in rows]
+            # A normalized skill relationship is verified source evidence. Link
+            # exact skill/alias mentions automatically, without inventing bullets
+            # or promoting unverified skills.
+            _sync_requirement_skill_evidence(write_session, rows, id)
+            run=write_session.get(OptimizationRun,run_id)
+            run.status="succeeded"; run.output_payload={"id":o.id,**fields,
+                "requirements":[{"id":row.id,"text":row.text,"category":row.category} for row in rows]}; run.completed_at=now(); write_session.commit(); write_session.refresh(o); return _analysis_response(o,write_session)
     except Exception as exc:
-        run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); s.commit(); raise HTTPException(503,"Codex provider unavailable: "+run.error)
+        with SessionLocal() as write_session:
+            run=write_session.get(OptimizationRun,run_id)
+            run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); write_session.commit()
+        raise HTTPException(503,"Codex provider unavailable: "+_run_error(exc))
 @app.get("/applications/{id}/analysis",response_model=JobAnalysisOut)
 def get_analysis(id:int,s:Session=Depends(db)):
     if not s.get(Application,id): raise HTTPException(404,"application not found")
@@ -2273,20 +2282,33 @@ def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=
         **context,"confirmations":[{"requirement_id":x.requirement_id,"requirement":x.requirement,"status":x.status,"context":x.context}
         for x in s.query(MissingConfirmation).filter_by(application_id=id)]}
     run=OptimizationRun(application_id=id,operation="proposal",idempotency_key=key,input_payload=payload,model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+    run_id=run.id
+    # The provider call is intentionally outside the transaction used to build
+    # its immutable input payload.
+    s.close()
     try:
         out=_provider_call(_provider(),"proposal",payload)
         if hasattr(out,"model_dump"): out=out.model_dump()
         if not isinstance(out,dict): raise ValueError("Codex returned invalid proposal")
         out={**out,"source_fingerprint":context["source_fingerprint"],"prompt_version":PROMPT_VERSION,
             "schema_version":SCHEMA_VERSION}
-        _validate_proposal_payload(a,out,s)
-        # Reuse the existing proposal validation gates before persistence.
-        p=Proposal(application_id=id,payload=out); s.add(p); s.flush()
-        run.status="succeeded"; run.output_payload={"id":p.id,**out}; run.completed_at=now(); s.commit(); s.refresh(p); return p
+        with SessionLocal() as write_session:
+            current_application=write_session.get(Application,id)
+            _validate_proposal_payload(current_application,out,write_session)
+            # Reuse the existing proposal validation gates before persistence.
+            p=Proposal(application_id=id,payload=out); write_session.add(p); write_session.flush()
+            run=write_session.get(OptimizationRun,run_id)
+            run.status="succeeded"; run.output_payload={"id":p.id,**out}; run.completed_at=now(); write_session.commit(); write_session.refresh(p); return p
     except ValidationError as exc:
-        run.status="failed"; run.error=str(exc)[:2000]; run.completed_at=now(); s.commit(); raise HTTPException(422,str(exc))
+        with SessionLocal() as write_session:
+            run=write_session.get(OptimizationRun,run_id)
+            run.status="failed"; run.error=str(exc)[:2000]; run.completed_at=now(); write_session.commit()
+        raise HTTPException(422,str(exc))
     except Exception as exc:
-        run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); s.commit(); raise HTTPException(503,"Codex provider unavailable: "+run.error)
+        with SessionLocal() as write_session:
+            run=write_session.get(OptimizationRun,run_id)
+            run.status="failed"; run.error=_run_error(exc); run.completed_at=now(); write_session.commit()
+        raise HTTPException(503,"Codex provider unavailable: "+_run_error(exc))
 
 @app.get("/applications/{id}/optimization-runs",response_model=list[OptimizationRunOut])
 def optimization_runs(id:int,s:Session=Depends(db)):
@@ -3322,24 +3344,56 @@ def generate(id:int,x:GenerateIn,s:Session=Depends(db)):
         code=409 if "source data changed" in str(exc) else 422
         raise HTTPException(code,str(exc))
     o=_reserve_revision(id,snap,s,status="generating")
+    revision_id=o.id
+    proposal_id=proposal.id
     out=GENERATED/'applications'/str(id)/f'revision-{o.revision_number:03d}'
+    staging_root=ROOT / ".generation-staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging=Path(tempfile.mkdtemp(prefix=f"revision-{revision_id}-",dir=staging_root))
+    # Rendering and PDF inspection can be slow; release the transaction before
+    # invoking external tooling and update the reserved run in a fresh one.
+    s.close()
     try:
-        tex,pdf=ResumeRenderer().compile(snap,out)
+        tex,pdf=ResumeRenderer().compile(snap,staging)
     except RuntimeError as exc:
-        o.status="failed"; s.commit()
+        shutil.rmtree(staging,ignore_errors=True)
+        with SessionLocal() as write_session:
+            o=write_session.get(Revision,revision_id)
+            o.status="failed"; write_session.commit()
         raise HTTPException(503,str(exc))
     try:
         page_count=count_pdf_pages(pdf)
     except (FileNotFoundError, RuntimeError) as exc:
-        o.status="failed"; s.commit()
+        shutil.rmtree(staging,ignore_errors=True)
+        with SessionLocal() as write_session:
+            o=write_session.get(Revision,revision_id)
+            o.status="failed"; write_session.commit()
         raise HTTPException(503,f"PDF was generated but could not be validated: {exc}")
-    o.latex_path=str(tex.relative_to(ROOT)); o.pdf_path=str(pdf.relative_to(ROOT)); o.page_count=page_count; o.generated_at=now(); o.status='draft'; s.commit(); s.refresh(o)
+    try:
+        # Backups only see a revision after all renderer output was validated.
+        # The lock covers the brief artifact publication/database-state boundary,
+        # not the slow compilation itself.
+        with OPERATION_BARRIER:
+            out.parent.mkdir(parents=True,exist_ok=True)
+            os.replace(staging,out)
+            tex=out/tex.name; pdf=out/pdf.name
+            with SessionLocal() as write_session:
+                o=write_session.get(Revision,revision_id)
+                o.latex_path=str(tex.relative_to(ROOT)); o.pdf_path=str(pdf.relative_to(ROOT)); o.page_count=page_count; o.generated_at=now(); o.status='draft'; write_session.commit(); write_session.refresh(o)
+                response={**{c.name:getattr(o,c.name) for c in Revision.__table__.columns},
+                    'proposal_id':proposal_id,
+                    'latex_url':'/generated/'+str(tex.relative_to(GENERATED)),
+                    'pdf_url':'/generated/'+str(pdf.relative_to(GENERATED))}
+    except Exception:
+        shutil.rmtree(staging,ignore_errors=True)
+        with SessionLocal() as write_session:
+            o=write_session.get(Revision,revision_id)
+            if o and o.status == "generating":
+                o.status="failed"; write_session.commit()
+        raise
     # Keep filesystem paths for local tooling and expose browser-served URLs
     # for the Vite UI. StaticFiles mounts the generated directory at /generated.
-    return {**{c.name:getattr(o,c.name) for c in Revision.__table__.columns},
-            'proposal_id':proposal.id,
-            'latex_url':'/generated/'+str(tex.relative_to(GENERATED)),
-            'pdf_url':'/generated/'+str(pdf.relative_to(GENERATED))}
+    return response
 
 @app.post("/applications/{id}/submit",response_model=ApplicationOut)
 def submit_application(id:int,x:SubmitRevisionIn,s:Session=Depends(db)):

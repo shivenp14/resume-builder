@@ -1,20 +1,268 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Resume Builder Rendering and Migration Audit</title>
-<style>body{font:16px system-ui,sans-serif;max-width:980px;margin:40px auto;padding:0 20px;color:#17202a;line-height:1.45}h1{margin-bottom:4px}h2{margin-top:28px;border-bottom:1px solid #ddd;padding-bottom:6px}.meta{color:#566573}.finding{border-left:5px solid;padding:12px 16px;margin:16px 0;background:#f8f9fa}.p1{border-color:#c0392b}.p2{border-color:#d68910}.p3{border-color:#2980b9}.tag{font-weight:700}.ok{color:#1e8449}.warn{color:#9a6700}code{background:#eef;padding:2px 4px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}</style></head>
-<body><h1>Resume Builder rendering and migration audit</h1>
-<p class="meta">Read-only audit of current uncommitted implementation · 2026-09-02 · <code>/Users/shivenpandya/projects/resume-builder</code></p>
-<h2>Verdict</h2><p><strong>Partially correct; not fully plan-complete.</strong> The sequential approved-proposal path is coherent and the project suite passes (19 tests), but rendering parity and migration safety have material gaps. PDF compilation is technically available, yet generated-PDF validation is shallow and not covered by tests.</p>
-<h2>Checks run</h2><ul><li><span class="ok">19 passed</span> via <code>backend/.venv/bin/pytest -q</code>.</li><li><span class="ok">Passed:</span> <code>python3 -m py_compile backend/seed_checkpoints.py</code> and <code>git diff --check</code>.</li><li><span class="ok">Available:</span> <code>latexmk</code> and <code>pdfinfo</code>. No fixture compile/PDF parity test is present.</li><li>Three low-thinking GPT-5.6 Luna reviewers independently audited rendering, migration, and integration; no files were edited by them.</li></ul>
-<h2>Findings</h2>
-<div class="finding p1"><span class="tag">P1 — Activity bullets are silently dropped.</span><br><code>backend/app/services/templates/resume.tex.j2:59-60</code> renders only <code>entry.summary</code> for activities. Any activity represented by bullets loses content in the generated TeX/PDF.</div>
-<div class="finding p2"><span class="tag">P2 — Migration can grant rewriteability using an ownership/name heuristic.</span><br><code>backend/seed_checkpoints.py:143-150</code> falls back to <code>contact.name</code> when owner metadata is missing, then unlocks evidence-free bullets without proving they originated from the matching checkpoint.</div>
-<div class="finding p2"><span class="tag">P2 — Migration is incomplete for locked bullets that already have facts.</span><br><code>backend/seed_checkpoints.py:149-150</code> updates only locked bullets with empty <code>supporting_facts</code>; other locked bullets remain locked despite the README's broader rewriteable description.</div>
-<div class="finding p2"><span class="tag">P2 — No checkpoint-content reconciliation protects migration scope.</span><br><code>backend/seed_checkpoints.py:145-150</code> migrates all bullets linked through entries for an owner-matched base, without checking checkpoint tags or comparing text to <code>resume.tex</code>.</div>
-<div class="finding p2"><span class="tag">P2 — PDF validation confirms existence, not validity or parity.</span><br><code>backend/app/services/renderer.py:38-40</code> checks only latexmk's return code and PDF existence; <code>backend/app/main.py:513-517</code> optionally extracts page count while swallowing errors. No content, overflow, or visual assertion exists.</div>
-<div class="finding p2"><span class="tag">P2 — Contact and activity formatting can diverge from baseline.</span><br><code>backend/app/services/templates/resume.tex.j2:50</code> can emit a stray separator before LinkedIn when it is the only populated field. <code>:59-60</code> concatenates multiple activity summaries without explicit separation.</div>
-<div class="finding p3"><span class="tag">P3 — Project skills are one opaque summary.</span><br><code>backend/app/main.py:427-438</code> assigns <code>item.summary</code> to project skills, and <code>resume.tex.j2:65</code> prints one escaped string; structured skill metadata cannot be represented.</div>
-<div class="finding p3"><span class="tag">P3 — Migration safety/idempotence is untested.</span><br><code>backend/seed_checkpoints.py:134-152</code> uses one final commit and no deletes, so repeated runs are generally idempotent and ordinary exceptions should roll back. There are no tests for repeated execution, mixed states, ownership, or rollback.</div>
-<h2>Correctly implemented</h2><ul><li><code>build_snapshot</code> preserves configured section order and inserts verified skills before activities: <code>backend/app/main.py:440-458</code>.</li><li>Contact, education, projects, skills, and ordinary experience map into the template; LaTeX escaping is applied by <code>renderer.py:10-13</code>.</li><li>Generation validates the approved proposal and compiles the materialized snapshot: <code>backend/app/main.py:494-518</code>.</li></ul>
-<h2>Plan judgment</h2><table><tr><th>Area</th><th>Judgment</th></tr><tr><td>Snapshot/rendering</td><td>Mostly correct for sequential standard entries.</td></tr><tr><td>Contact/education/projects/skills</td><td>Functional, with edge cases.</td></tr><tr><td>Activities</td><td>Not correct: bullets are lost.</td></tr><tr><td>--migrate-verified</td><td>Usually repeatable and row-preserving, but scope is too broad and behavior incomplete.</td></tr><tr><td>PDF validation</td><td>Compilation can run locally; parity validation is insufficient.</td></tr></table>
-<h2>Recommended follow-up</h2><ol><li>Render activity bullets and separate activity entries.</li><li>Restrict migration to checkpoint-tagged, source-matching records and test repeated/mixed/rollback cases.</li><li>Add latexmk fixture tests with PDF text extraction and page/overflow assertions.</li><li>Fix the contact separator condition and decide whether project skills should be structured.</li></ol>
-</body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Functional backend and frontend audit for the Resume Builder workspace.">
+  <title>Resume Builder · Functional Audit Report</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #586575;
+      --line: #d9e0e7;
+      --surface: #ffffff;
+      --surface-soft: #f5f7fa;
+      --accent: #2457c5;
+      --accent-soft: #eaf0ff;
+      --critical: #a61b1b;
+      --critical-soft: #fff0f0;
+      --high: #9a4c00;
+      --high-soft: #fff5e8;
+      --medium: #6b5500;
+      --medium-soft: #fff9df;
+      --low: #146047;
+      --low-soft: #eaf8f1;
+      --shadow: 0 10px 28px rgba(25, 40, 60, .07);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: #eef2f6;
+      color: var(--ink);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); }
+    code, .path, .command { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { color: #213450; font-size: .92em; }
+    .shell { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+    header.hero {
+      color: white;
+      background: linear-gradient(135deg, #142b56, #2457c5);
+      border-radius: 18px;
+      padding: 34px 36px;
+      box-shadow: var(--shadow);
+    }
+    .eyebrow { margin: 0 0 8px; color: #cfe0ff; text-transform: uppercase; letter-spacing: .12em; font-size: 12px; font-weight: 700; }
+    h1, h2, h3 { line-height: 1.2; margin: 0; }
+    h1 { font-size: clamp(28px, 4vw, 44px); letter-spacing: -.03em; }
+    .hero p { max-width: 780px; margin: 14px 0 0; color: #e7efff; font-size: 17px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 22px; color: #d6e4ff; font-size: 13px; }
+    .meta strong { color: white; }
+    .layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 22px; margin-top: 22px; align-items: start; }
+    nav.toc { position: sticky; top: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); }
+    nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); margin-bottom: 9px; }
+    nav.toc a { display: block; padding: 6px 0; text-decoration: none; font-size: 13px; }
+    main { min-width: 0; }
+    section.card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 25px; margin-bottom: 18px; box-shadow: var(--shadow); }
+    section.card > h2 { font-size: 24px; margin-bottom: 14px; }
+    section.card > h3 { font-size: 18px; margin: 22px 0 8px; }
+    .lede { color: var(--muted); margin: -4px 0 18px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 18px 0 20px; }
+    .stat { border: 1px solid var(--line); border-radius: 10px; padding: 14px; background: var(--surface-soft); }
+    .stat b { display: block; font-size: 24px; line-height: 1; margin-bottom: 5px; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .callout { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 13px 15px; border-radius: 0 9px 9px 0; }
+    .callout strong { color: #153c93; }
+    .status { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .critical { color: var(--critical); background: var(--critical-soft); }
+    .high { color: var(--high); background: var(--high-soft); }
+    .medium { color: var(--medium); background: var(--medium-soft); }
+    .low { color: var(--low); background: var(--low-soft); }
+    .findings-toolbar { display: flex; flex-wrap: wrap; gap: 9px; margin: 14px 0 17px; }
+    .findings-toolbar input { flex: 1 1 240px; min-width: 180px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit; }
+    .filter { cursor: pointer; border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: white; color: var(--muted); font: inherit; }
+    .filter[aria-pressed="true"] { color: white; background: var(--accent); border-color: var(--accent); }
+    .finding { border: 1px solid var(--line); border-radius: 11px; margin: 10px 0; overflow: hidden; }
+    .finding[hidden] { display: none; }
+    .finding summary { cursor: pointer; list-style: none; padding: 14px 16px; display: grid; grid-template-columns: 82px minmax(0,1fr) auto; gap: 12px; align-items: center; }
+    .finding summary::-webkit-details-marker { display: none; }
+    .finding summary::after { content: "+"; color: var(--muted); font-size: 20px; }
+    .finding[open] summary::after { content: "−"; }
+    .finding-title { font-weight: 700; }
+    .finding-body { border-top: 1px solid var(--line); background: #fcfdff; padding: 14px 16px 17px 110px; }
+    .finding-body p { margin: 0 0 10px; }
+    .finding-body p:last-child { margin-bottom: 0; }
+    .refs { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+    .path { display: inline-block; padding: 3px 7px; border: 1px solid #ccd7e6; border-radius: 5px; background: #f1f5fa; color: #263c5a; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; vertical-align: top; padding: 11px 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; background: var(--surface-soft); }
+    tr:last-child td { border-bottom: 0; }
+    .command { display: block; overflow-x: auto; margin: 7px 0 4px; padding: 10px 12px; background: #182536; color: #e4efff; border-radius: 7px; font-size: 12px; }
+    .result-pass { color: var(--low); font-weight: 700; }
+    .result-fail { color: var(--critical); font-weight: 700; }
+    ol.repair { counter-reset: repair; list-style: none; padding: 0; margin: 0; }
+    ol.repair li { counter-increment: repair; position: relative; padding: 0 0 17px 48px; border-left: 2px solid #cad8ee; margin-left: 15px; }
+    ol.repair li::before { content: counter(repair); position: absolute; left: -17px; top: -3px; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: white; font-weight: 700; }
+    ol.repair li:last-child { border-left-color: transparent; }
+    ol.repair b { display: block; margin-bottom: 3px; }
+    footer { color: var(--muted); text-align: center; padding-top: 8px; font-size: 13px; }
+    @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } nav.toc { position: static; } .summary-grid { grid-template-columns: repeat(2, 1fr); } .finding summary { grid-template-columns: 70px minmax(0,1fr) auto; } .finding-body { padding-left: 16px; } }
+    @media (max-width: 470px) { .shell { padding: 12px 10px 38px; } header.hero, section.card { padding: 19px; } .summary-grid { grid-template-columns: 1fr 1fr; } .finding summary { grid-template-columns: 1fr auto; } .finding summary .status { grid-column: 1 / -1; width: max-content; } }
+    @media print { body { background: white; } .shell { max-width: none; padding: 0; } header.hero, section.card, nav.toc { box-shadow: none; } nav.toc, .findings-toolbar { display: none; } .layout { display: block; } section.card { break-inside: avoid; } .finding { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <p class="eyebrow">Resume Builder · Engineering Review</p>
+      <h1>Functional audit report</h1>
+      <p>A thorough review of backend and frontend structure, runtime correctness, efficiency, and operational risks. Visual and design quality were intentionally excluded from scope.</p>
+      <div class="meta"><span><strong>Review date:</strong> 2026-09-11</span><span><strong>Scope:</strong> backend + frontend functionality</span><span><strong>Artifact:</strong> self-contained HTML</span><span><strong>Code changes:</strong> none</span></div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="Report sections">
+        <h2>Contents</h2>
+        <a href="#summary">Executive summary</a>
+        <a href="#verification">Verification</a>
+        <a href="#critical">Critical / high</a>
+        <a href="#correctness">Correctness / scale</a>
+        <a href="#structure">Structure / operations</a>
+        <a href="#repair">Repair sequence</a>
+        <a href="#scope">Scope and assumptions</a>
+      </nav>
+
+      <main>
+        <section class="card" id="summary">
+          <h2>Executive summary</h2>
+          <p class="lede">The application has a healthy tested backend foundation and a successful frontend production build, but several functional and operational risks become significant under concurrent use, stale data, or a fresh-clone setup.</p>
+          <div class="summary-grid" aria-label="Finding counts">
+            <div class="stat"><b>7</b><span>critical / high-priority findings</span></div>
+            <div class="stat"><b>8</b><span>correctness / scalability findings</span></div>
+            <div class="stat"><b>5</b><span>structural / operational findings</span></div>
+            <div class="stat"><b>100</b><span>backend tests passing in review run</span></div>
+          </div>
+          <div class="callout"><strong>Top repair theme:</strong> protect request isolation and data freshness first. The global database barrier currently covers long-running provider and rendering work, while job-description edits can leave analyses and proposals pointing at old requirements.</div>
+          <h3>What is working</h3>
+          <p>The backend test suite completed successfully, the frontend production build completed successfully, proposal validation preserves source ownership/evidence checks, and generated revisions are modeled as immutable snapshots. These positives do not remove the concurrency, stale-data, startup, and frontend error-state concerns below.</p>
+        </section>
+
+        <section class="card" id="verification">
+          <h2>Verification evidence</h2>
+          <p class="lede">Results recorded during the review. The commands below are the reproducible checks used to establish the baseline.</p>
+          <table>
+            <thead><tr><th>Check</th><th>Command</th><th>Observed result</th></tr></thead>
+            <tbody>
+              <tr><td>Backend tests</td><td><span class="command">backend/.venv/bin/python -m pytest -q</span></td><td><span class="result-pass">PASS · 100 tests passed</span></td></tr>
+              <tr><td>Frontend production build</td><td><span class="command">npm run build</span></td><td><span class="result-pass">PASS · Vite build completed</span></td></tr>
+              <tr><td>Standalone backend dev script</td><td><span class="command">npm run dev:backend</span></td><td><span class="result-fail">FAIL from repository root</span> · uses system Python and cannot import <code>backend/app</code>; the combined <code>npm run dev</code> path works around it by changing the backend cwd.</td></tr>
+              <tr><td>Source/test inventory</td><td><span class="command">rg --files</span></td><td>Backend tests are present; no frontend functional or end-to-end test suite was found.</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="card" id="critical">
+          <h2>Prioritized findings</h2>
+          <p class="lede">Use the filter or search box to narrow the review. Expand a finding for impact, evidence, and a concise repair direction.</p>
+          <div class="findings-toolbar" role="toolbar" aria-label="Finding filters">
+            <input id="finding-search" type="search" placeholder="Search findings, files, or keywords" aria-label="Search findings">
+            <button class="filter" type="button" data-filter="all" aria-pressed="true">All</button>
+            <button class="filter" type="button" data-filter="critical">Critical</button>
+            <button class="filter" type="button" data-filter="high">High</button>
+            <button class="filter" type="button" data-filter="medium">Medium</button>
+            <button class="filter" type="button" data-filter="low">Low</button>
+          </div>
+
+          <details class="finding" data-severity="critical" open>
+            <summary><span class="status critical">CRITICAL</span><span class="finding-title">One global request lock serializes the entire database-backed request</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> every request using the dependency waits behind <code>OPERATION_BARRIER</code>, including provider calls that may take up to 120 seconds and PDF rendering. A single slow analysis or hung render can block unrelated reads and writes.</p><p><strong>Repair:</strong> narrow locking to SQLite backup/file mutation boundaries, use transaction-scoped sessions, and move long-running provider/render work outside the global barrier with explicit job/run state.</p><div class="refs"><span class="path">backend/app/main.py:1055</span><span class="path">backend/app/main.py:2196</span></div></div>
+          </details>
+          <details class="finding" data-severity="critical">
+            <summary><span class="status critical">CRITICAL</span><span class="finding-title">Job-description edits do not invalidate saved analyses or proposals</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> after a job description changes, the UI/API can continue to show and act on requirements or proposals generated from the previous text. This is a data-freshness correctness risk.</p><p><strong>Repair:</strong> on JD mutation, invalidate or version the current analysis/proposals, clear stale “approved” state, and require a fresh analysis before proposal generation or artifact creation.</p><div class="refs"><span class="path">backend/app/main.py:1919</span><span class="path">backend/app/main.py:2001</span><span class="path">backend/app/main.py:2262</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">LaTeX compilation has no subprocess timeout</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> a hung <code>latexmk</code> process can hold the request open indefinitely and, together with the global barrier, starve the API.</p><p><strong>Repair:</strong> pass a bounded timeout to the compiler, terminate the process group on expiry, preserve diagnostic output, and mark the generation run failed without leaving partial artifacts.</p><div class="refs"><span class="path">backend/app/services/renderer.py:83</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">Fresh-clone startup can fail because checkpoints are mounted unconditionally</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> <code>/checkpoints</code> is gitignored/untracked but is mounted during app import. A clean clone without that directory can fail before the health endpoint is available.</p><p><strong>Repair:</strong> create the directory before mounting, mount it only when present, or make checkpoint import an explicit setup step.</p><div class="refs"><span class="path">backend/app/main.py:1323</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">Standalone backend development script is broken from repository root</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> <code>npm run dev:backend</code> uses system Python from the root, so the <code>app</code> package is not importable. This creates a misleading setup path and slows recovery/debugging.</p><p><strong>Repair:</strong> mirror <code>scripts/dev.mjs</code>: choose <code>backend/.venv/bin/python</code> when available and run Uvicorn with <code>cwd=backend</code>; or expose a root-level module path explicitly.</p><div class="refs"><span class="path">package.json:8</span><span class="path">scripts/dev.mjs:5</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">Frontend can submit duplicate analyses</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> the application detail view renders two Analyze actions, but only one is disabled while the request is active. Repeated clicks can issue duplicate work; requests are not consistently protected by idempotency keys.</p><p><strong>Repair:</strong> centralize the action, disable every trigger while busy, send an idempotency key, and make the backend return the existing run/result for repeated keys.</p><div class="refs"><span class="path">src/main.jsx:11</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">Application-list failures are rendered as an empty workspace</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> an API/network outage is indistinguishable from “no applications,” which can lead users to create duplicate records or assume data was lost.</p><p><strong>Repair:</strong> retain the load error separately from the data array and render an explicit recoverable error state with retry.</p><div class="refs"><span class="path">src/main.jsx:16</span></div></div>
+          </details>
+        </section>
+
+        <section class="card" id="correctness">
+          <h2>Correctness and scalability</h2>
+          <p class="lede">These issues are important after the critical/high risks are contained, especially as source and application history grows.</p>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">PATCH models are full-input models and may reset omitted fields</span><span></span></summary><div class="finding-body"><p>Resume and bullet PATCH routes accept models that behave like complete payloads. A caller that omits a field can unintentionally write its default, losing existing data. Use optional patch fields and apply only explicitly supplied values.</p><div class="refs"><span class="path">backend/app/main.py:1530</span><span class="path">backend/app/main.py:1771</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Nullable ItemPatch fields can write NULL into required columns</span><span></span></summary><div class="finding-body"><p>Because nullable fields are accepted and then persisted, invalid updates can reach database constraints and surface as unhandled 500s. Validate required-field invariants at the API boundary and return a client-safe 422.</p><div class="refs"><span class="path">backend/app/main.py:1064</span><span class="path">backend/app/main.py:1416</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Duplicate resume entries can leak a database uniqueness error</span><span></span></summary><div class="finding-body"><p>The unique resume-entry constraint is correct, but the duplicate path is not translated into a stable conflict response. Catch the integrity error, roll back, and return a clear 409/422 that the UI can explain.</p><div class="refs"><span class="path">backend/app/main.py:1790</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Comparison/proposal paths perform repeated per-requirement queries</span><span></span></summary><div class="finding-body"><p>Evidence and source lookups repeat inside requirement loops, creating N+1 behavior. Batch-load requirements, evidence, bullets, skills, and content items, then index them in memory before building the response.</p><div class="refs"><span class="path">backend/app/main.py:2058</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Startup migrations rescan substantial tables on every import</span><span></span></summary><div class="finding-body"><p>Import-time integrity/backfill work scans analyses, content items, and bullets. This increases cold-start time and couples application import to migration volume. Move this work into versioned, one-time migrations or an explicit maintenance command.</p><div class="refs"><span class="path">backend/app/main.py:983</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Frontend fetches only the first 50 applications and filters locally</span><span></span></summary><div class="finding-body"><p>Records beyond the first page are not searchable or reachable from the list. Add server-side query/status filtering with pagination, or load pages progressively while preserving total/result state.</p><div class="refs"><span class="path">src/main.jsx:16</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Several data-load failures look like empty content</span><span></span></summary><div class="finding-body"><p>Source-item bullets, links, entries, or profiles can render as empty sections when their fetch fails. Preserve and display the error state separately from an empty successful response.</p><div class="refs"><span class="path">src/source-workflows.jsx:128</span><span class="path">src/source-workflows.jsx:199</span></div></div></details>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Frontend reconstructs generated URLs instead of using API-returned URLs</span><span></span></summary><div class="finding-body"><p>Discarding server-provided URLs couples the UI to the current storage path convention. Render the returned <code>latex_url</code>/<code>pdf_url</code> values and keep path ownership in the API.</p><div class="refs"><span class="path">src/application-workflows.jsx:254</span></div></div></details>
+        </section>
+
+        <section class="card" id="structure">
+          <h2>Structural and operational findings</h2>
+          <details class="finding" data-severity="low" open><summary><span class="status low">LOW</span><span class="finding-title">Backend responsibilities are concentrated in one 3,378-line module</span><span></span></summary><div class="finding-body"><p>Models, schemas, migrations, route handlers, and business logic all live in <code>main.py</code>. This raises change coupling and makes targeted testing harder. Split by domain (models, schemas, repositories/services, routes) behind stable boundaries.</p><div class="refs"><span class="path">backend/app/main.py:1</span></div></div></details>
+          <details class="finding" data-severity="low"><summary><span class="status low">LOW</span><span class="finding-title">Schema management mixes import-time create_all with custom migrations</span><span></span></summary><div class="finding-body"><p>Adopt versioned migrations and resolve/configure the circular <code>applications</code>/<code>revisions</code> foreign-key relationship called out by test warnings. Keep schema changes out of normal request-process import paths.</p><div class="refs"><span class="path">backend/app/main.py:983</span><span class="path">backend/tests/conftest.py</span></div></div></details>
+          <details class="finding" data-severity="low"><summary><span class="status low">LOW</span><span class="finding-title">Dependencies are not pinned to a tested set</span><span></span></summary><div class="finding-body"><p>Frontend packages use <code>latest</code>; backend requirements are lower-bounded and duplicate Jinja. Pin versions (or use a lockfile/constraints file) to make builds and production upgrades reproducible.</p><div class="refs"><span class="path">package.json:13</span><span class="path">backend/requirements.txt:1</span></div></div></details>
+          <details class="finding" data-severity="low"><summary><span class="status low">LOW</span><span class="finding-title">There is no frontend functional or end-to-end test suite</span><span></span></summary><div class="finding-body"><p>The successful production build catches bundling errors but not loading/error-state regressions, duplicate actions, pagination behavior, or workflow transitions. Add focused component tests plus a small API-backed browser smoke suite.</p></div></details>
+          <details class="finding" data-severity="low"><summary><span class="status low">LOW</span><span class="finding-title">Generated and checkpoint artifacts are exposed without authentication</span><span></span></summary><div class="finding-body"><p>If the server is reachable beyond loopback, static mounts can expose sensitive resume artifacts. Keep deployment loopback-only by default or add authentication/authorization and restrict artifact paths.</p><div class="refs"><span class="path">backend/app/main.py:1322</span></div></div></details>
+        </section>
+
+        <section class="card" id="repair">
+          <h2>Recommended repair sequence</h2>
+          <p class="lede">This order reduces user-visible correctness risk first, then makes the system easier to scale and maintain.</p>
+          <ol class="repair">
+            <li><b>Separate long-running work from the global barrier.</b> Narrow SQLite/file locks, add bounded provider/render execution, and preserve run status on timeout/failure.</li>
+            <li><b>Make application data freshness explicit.</b> Version or invalidate analyses/proposals when job descriptions change; require current inputs at proposal and generation boundaries.</li>
+            <li><b>Repair startup and local development paths.</b> Handle a missing checkpoints directory and make <code>npm run dev:backend</code> select the project virtualenv/cwd consistently.</li>
+            <li><b>Harden PATCH and conflict semantics.</b> Use true partial-update schemas, validate required fields, and translate uniqueness/integrity failures into stable client errors.</li>
+            <li><b>Fix frontend state handling.</b> Centralize/disable duplicate actions, add idempotency keys, preserve load errors, and implement server-side pagination/search.</li>
+            <li><b>Reduce query and migration coupling.</b> Batch evidence/source reads, adopt versioned migrations, split the backend module by domain, and pin dependencies.</li>
+            <li><b>Add regression coverage.</b> Cover stale-analysis invalidation, timeout cleanup, fresh-clone startup, PATCH omission semantics, pagination/error states, and an end-to-end happy path.</li>
+          </ol>
+        </section>
+
+        <section class="card" id="scope">
+          <h2>Scope, assumptions, and handoff</h2>
+          <p>This review deliberately excludes visual design, styling, layout, typography, animation, and other appearance-based concerns. It focuses on file/code structure, functional correctness, errors, runtime efficiency, data freshness, startup behavior, and operational exposure.</p>
+          <p>Findings are based on the repository state and verification results available during the review. Line references identify the reviewed locations; they may shift after code edits. No application source files were changed to produce this report.</p>
+          <p><strong>Suggested next handoff:</strong> address the first five repair steps, then rerun the backend suite, frontend build, and a browser/API smoke path before expanding the refactor.</p>
+        </section>
+      </main>
+    </div>
+    <footer>Generated for the Resume Builder workspace · functional review only</footer>
+  </div>
+  <script>
+    (() => {
+      const search = document.querySelector('#finding-search');
+      const buttons = [...document.querySelectorAll('.filter')];
+      const findings = [...document.querySelectorAll('.finding')];
+      let active = 'all';
+      function apply() {
+        const query = (search.value || '').trim().toLowerCase();
+        findings.forEach((finding) => {
+          const matchesSeverity = active === 'all' || finding.dataset.severity === active;
+          const matchesText = !query || finding.textContent.toLowerCase().includes(query);
+          finding.hidden = !(matchesSeverity && matchesText);
+        });
+      }
+      buttons.forEach((button) => button.addEventListener('click', () => {
+        active = button.dataset.filter;
+        buttons.forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+        apply();
+      }));
+      search.addEventListener('input', apply);
+    })();
+  </script>
+</body>
+</html>
