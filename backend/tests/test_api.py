@@ -36,6 +36,19 @@ def test_analysis_and_immutable_revision_numbers():
     assert (first['revision_number'], second['revision_number']) == (1,2)
     assert client.get(f"/applications/{application['id']}/revisions").json()[0]['resume_json'] == snapshot
 
+
+def test_analysis_idempotency_key_header_reuses_the_completed_result():
+    resume = client.post('/base-resumes', json={'name': 'Header replay'}).json()
+    application = client.post('/applications', json={
+        'company': 'Test', 'position': 'Role', 'job_description': 'Need Python',
+        'base_resume_id': resume['id'],
+    }).json()
+    path = f"/applications/{application['id']}/analyze"
+    first = client.post(path, headers={'Idempotency-Key': 'analyze-header-replay'})
+    second = client.post(path, headers={'Idempotency-Key': 'analyze-header-replay'})
+    assert first.status_code == second.status_code == 200
+    assert first.json()['id'] == second.json()['id']
+
 def test_reference_integrity_and_revision_shape():
     first = client.post('/content-items', json={'type':'experience','title':'First'}).json()
     second = client.post('/content-items', json={'type':'experience','title':'Second'}).json()

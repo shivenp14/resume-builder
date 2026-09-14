@@ -9,7 +9,7 @@ from pathlib import Path
 import threading
 from typing import Any, Literal
 import uuid
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
@@ -1315,12 +1315,17 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Idempotency-Key"],
 )
 GENERATED = ROOT / "generated"
 GENERATED.mkdir(exist_ok=True)
 app.mount("/generated", StaticFiles(directory=GENERATED), name="generated")
-app.mount("/checkpoints", StaticFiles(directory=ROOT / "checkpoints"), name="checkpoints")
+CHECKPOINTS = ROOT / "checkpoints"
+# Checkpoints are deliberately untracked. Ensure a clean clone can still
+# import the application and serve its health endpoint before any checkpoint
+# artifact has been created.
+CHECKPOINTS.mkdir(exist_ok=True)
+app.mount("/checkpoints", StaticFiles(directory=CHECKPOINTS), name="checkpoints")
 @app.get("/health",response_model=HealthOut)
 def health(): return {"status":"ok"}
 
@@ -2194,10 +2199,13 @@ def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fr
     return context
 
 @app.post("/applications/{id}/analyze",response_model=JobAnalysisOut)
-def analyze(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)):
+def analyze(id:int, request:OptimizationRequest|None=None, idempotency_key: str|None=Header(default=None, alias="Idempotency-Key"), s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
-    key=request.idempotency_key if request else None
+    body_key=request.idempotency_key if request else None
+    if body_key and idempotency_key and body_key != idempotency_key:
+        raise HTTPException(400,"idempotency key must match the Idempotency-Key header")
+    key=idempotency_key or body_key
     if key:
         prior=s.query(OptimizationRun).filter_by(application_id=id,operation="analysis",idempotency_key=key).first()
         if prior and prior.status=="succeeded" and prior.output_payload:

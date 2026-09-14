@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from pypdf import PdfWriter
 
 from backend.app.services import renderer
@@ -83,3 +84,30 @@ def test_count_pdf_pages_reports_missing_or_invalid_artifact(tmp_path: Path):
         assert "does not exist" in str(exc)
     else:
         raise AssertionError("missing PDF should fail loudly")
+
+
+def test_compile_times_out_kills_process_group_and_cleans_partial_artifacts(
+    tmp_path: Path,
+):
+    latexmk = tmp_path / "fake-latexmk"
+    latexmk.write_text(
+        "#!/bin/sh\n"
+        "outdir=${4#-outdir=}\n"
+        "printf 'partial' > \"$outdir/resume.pdf\"\n"
+        "printf 'compiler diagnostic' >&2\n"
+        "sleep 60\n",
+        encoding="utf-8",
+    )
+    latexmk.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match=r"timed out after 1 seconds") as exc_info:
+        renderer.ResumeRenderer().compile(
+            {"contact": {}, "sections": []},
+            tmp_path / "output",
+            latexmk=str(latexmk),
+            timeout_seconds=1.0,
+        )
+
+    assert "compiler diagnostic" in str(exc_info.value)
+    assert not (tmp_path / "output" / "resume.pdf").exists()
+    assert not (tmp_path / "output" / "resume.tex").exists()
