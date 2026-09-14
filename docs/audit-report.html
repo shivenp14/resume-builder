@@ -70,6 +70,7 @@
     .high { color: var(--high); background: var(--high-soft); }
     .medium { color: var(--medium); background: var(--medium-soft); }
     .low { color: var(--low); background: var(--low-soft); }
+    .resolved { color: var(--low); background: var(--low-soft); }
     .findings-toolbar { display: flex; flex-wrap: wrap; gap: 9px; margin: 14px 0 17px; }
     .findings-toolbar input { flex: 1 1 240px; min-width: 180px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit; }
     .filter { cursor: pointer; border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; background: white; color: var(--muted); font: inherit; }
@@ -130,12 +131,12 @@
           <h2>Executive summary</h2>
           <p class="lede">The application has a healthy tested backend foundation and a successful frontend production build, but several functional and operational risks become significant under concurrent use, stale data, or a fresh-clone setup.</p>
           <div class="summary-grid" aria-label="Finding counts">
-            <div class="stat"><b>7</b><span>critical / high-priority findings</span></div>
+            <div class="stat"><b>0</b><span>open critical / high-priority findings</span></div>
             <div class="stat"><b>8</b><span>correctness / scalability findings</span></div>
             <div class="stat"><b>5</b><span>structural / operational findings</span></div>
-            <div class="stat"><b>100</b><span>backend tests passing in review run</span></div>
+            <div class="stat"><b>105</b><span>backend tests passing after remediation</span></div>
           </div>
-          <div class="callout"><strong>Top repair theme:</strong> protect request isolation and data freshness first. The global database barrier currently covers long-running provider and rendering work, while job-description edits can leave analyses and proposals pointing at old requirements.</div>
+          <div class="callout"><strong>High-priority remediation complete:</strong> compiler work is bounded, fresh clones and standalone development start reliably, and the application interface now prevents duplicate analysis submissions and exposes recoverable list-load failures.</div>
           <h3>What is working</h3>
           <p>The backend test suite completed successfully, the frontend production build completed successfully, proposal validation preserves source ownership/evidence checks, and generated revisions are modeled as immutable snapshots. These positives do not remove the concurrency, stale-data, startup, and frontend error-state concerns below.</p>
         </section>
@@ -146,7 +147,7 @@
           <table>
             <thead><tr><th>Check</th><th>Command</th><th>Observed result</th></tr></thead>
             <tbody>
-              <tr><td>Backend tests</td><td><span class="command">backend/.venv/bin/python -m pytest -q</span></td><td><span class="result-pass">PASS · 100 tests passed</span></td></tr>
+              <tr><td>Backend tests after high-priority remediation</td><td><span class="command">backend/.venv/bin/python -m pytest -q backend/tests</span></td><td><span class="result-pass">PASS · 105 tests passed</span> · includes concurrency, job-description freshness, compiler-timeout, and idempotency replay regression coverage.</td></tr>
               <tr><td>Frontend production build</td><td><span class="command">npm run build</span></td><td><span class="result-pass">PASS · Vite build completed</span></td></tr>
               <tr><td>Standalone backend dev script</td><td><span class="command">npm run dev:backend</span></td><td><span class="result-fail">FAIL from repository root</span> · uses system Python and cannot import <code>backend/app</code>; the combined <code>npm run dev</code> path works around it by changing the backend cwd.</td></tr>
               <tr><td>Source/test inventory</td><td><span class="command">rg --files</span></td><td>Backend tests are present; no frontend functional or end-to-end test suite was found.</td></tr>
@@ -166,33 +167,33 @@
             <button class="filter" type="button" data-filter="low">Low</button>
           </div>
 
-          <details class="finding" data-severity="critical" open>
-            <summary><span class="status critical">CRITICAL</span><span class="finding-title">One global request lock serializes the entire database-backed request</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> every request using the dependency waits behind <code>OPERATION_BARRIER</code>, including provider calls that may take up to 120 seconds and PDF rendering. A single slow analysis or hung render can block unrelated reads and writes.</p><p><strong>Repair:</strong> narrow locking to SQLite backup/file mutation boundaries, use transaction-scoped sessions, and move long-running provider/render work outside the global barrier with explicit job/run state.</p><div class="refs"><span class="path">backend/app/main.py:1055</span><span class="path">backend/app/main.py:2196</span></div></div>
+          <details class="finding" data-severity="resolved" open>
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Request-wide database lock no longer serializes provider and rendering work</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> database dependencies now provide per-request sessions without acquiring <code>OPERATION_BARRIER</code>. Analysis, proposal generation, and rendering commit their run state before slow provider/compiler work; rendering publishes only a validated staged artifact while holding the short backup/publication lock.</p><p><strong>Verification:</strong> the backend suite passes with a concurrency regression test that pauses analysis at the provider and confirms an unrelated application-list request completes before it is released.</p><div class="refs"><span class="path">backend/app/main.py:1133</span><span class="path">backend/app/main.py:2334</span><span class="path">backend/app/main.py:3521</span><span class="path">backend/tests/test_request_isolation.py:14</span></div></div>
           </details>
-          <details class="finding" data-severity="critical">
-            <summary><span class="status critical">CRITICAL</span><span class="finding-title">Job-description edits do not invalidate saved analyses or proposals</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> after a job description changes, the UI/API can continue to show and act on requirements or proposals generated from the previous text. This is a data-freshness correctness risk.</p><p><strong>Repair:</strong> on JD mutation, invalidate or version the current analysis/proposals, clear stale “approved” state, and require a fresh analysis before proposal generation or artifact creation.</p><div class="refs"><span class="path">backend/app/main.py:1919</span><span class="path">backend/app/main.py:2001</span><span class="path">backend/app/main.py:2262</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Job-description edits now invalidate analyses and proposals</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> applications, analyses, and proposals carry a job-description version and fingerprint. A changed description advances that identity; stale analyses are excluded, and proposal/generation boundaries reject payloads created for a prior description.</p><p><strong>Verification:</strong> freshness regression coverage exercises stale analysis and proposal rejection after a job-description edit.</p><div class="refs"><span class="path">backend/app/main.py:1936</span><span class="path">backend/app/main.py:2326</span><span class="path">backend/tests/test_job_description_freshness.py:59</span></div></div>
           </details>
-          <details class="finding" data-severity="high">
-            <summary><span class="status high">HIGH</span><span class="finding-title">LaTeX compilation has no subprocess timeout</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> a hung <code>latexmk</code> process can hold the request open indefinitely and, together with the global barrier, starve the API.</p><p><strong>Repair:</strong> pass a bounded timeout to the compiler, terminate the process group on expiry, preserve diagnostic output, and mark the generation run failed without leaving partial artifacts.</p><div class="refs"><span class="path">backend/app/services/renderer.py:83</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">LaTeX compilation is bounded and cleans up timed-out runs</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> compilation now has a configurable 120-second default timeout, runs in its own process group, terminates descendants on expiry, retains diagnostic output, and removes partial compiler artifacts.</p><p><strong>Verification:</strong> renderer regression coverage exercises a hung compiler, captured diagnostics, process cleanup, and partial-artifact removal.</p><div class="refs"><span class="path">backend/app/services/renderer.py</span><span class="path">backend/tests/test_renderer.py</span></div></div>
           </details>
-          <details class="finding" data-severity="high">
-            <summary><span class="status high">HIGH</span><span class="finding-title">Fresh-clone startup can fail because checkpoints are mounted unconditionally</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> <code>/checkpoints</code> is gitignored/untracked but is mounted during app import. A clean clone without that directory can fail before the health endpoint is available.</p><p><strong>Repair:</strong> create the directory before mounting, mount it only when present, or make checkpoint import an explicit setup step.</p><div class="refs"><span class="path">backend/app/main.py:1323</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Fresh-clone startup creates the checkpoint mount safely</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> the untracked checkpoint directory is created before its static mount is configured, allowing application import and health checks from a clean clone.</p><div class="refs"><span class="path">backend/app/main.py</span></div></div>
           </details>
-          <details class="finding" data-severity="high">
-            <summary><span class="status high">HIGH</span><span class="finding-title">Standalone backend development script is broken from repository root</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> <code>npm run dev:backend</code> uses system Python from the root, so the <code>app</code> package is not importable. This creates a misleading setup path and slows recovery/debugging.</p><p><strong>Repair:</strong> mirror <code>scripts/dev.mjs</code>: choose <code>backend/.venv/bin/python</code> when available and run Uvicorn with <code>cwd=backend</code>; or expose a root-level module path explicitly.</p><div class="refs"><span class="path">package.json:8</span><span class="path">scripts/dev.mjs:5</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Standalone backend development starts from the repository root</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> <code>npm run dev:backend</code> now selects <code>backend/.venv/bin/python</code> when available, otherwise <code>python3</code>, and launches Uvicorn with <code>backend</code> as its working directory.</p><div class="refs"><span class="path">package.json</span><span class="path">scripts/dev-backend.mjs</span></div></div>
           </details>
-          <details class="finding" data-severity="high">
-            <summary><span class="status high">HIGH</span><span class="finding-title">Frontend can submit duplicate analyses</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> the application detail view renders two Analyze actions, but only one is disabled while the request is active. Repeated clicks can issue duplicate work; requests are not consistently protected by idempotency keys.</p><p><strong>Repair:</strong> centralize the action, disable every trigger while busy, send an idempotency key, and make the backend return the existing run/result for repeated keys.</p><div class="refs"><span class="path">src/main.jsx:11</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Analysis submission is guarded against duplicate work</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> both Analyze actions use one busy guard and disable together. Each attempt uses a stable idempotency key in the standard header and request body; the API replays the completed current result for that key.</p><p><strong>Verification:</strong> API coverage confirms header-key replay returns the original analysis rather than creating another one.</p><div class="refs"><span class="path">src/main.jsx</span><span class="path">backend/app/main.py</span><span class="path">backend/tests/test_api.py</span></div></div>
           </details>
-          <details class="finding" data-severity="high">
-            <summary><span class="status high">HIGH</span><span class="finding-title">Application-list failures are rendered as an empty workspace</span><span></span></summary>
-            <div class="finding-body"><p><strong>Impact:</strong> an API/network outage is indistinguishable from “no applications,” which can lead users to create duplicate records or assume data was lost.</p><p><strong>Repair:</strong> retain the load error separately from the data array and render an explicit recoverable error state with retry.</p><div class="refs"><span class="path">src/main.jsx:16</span></div></div>
+          <details class="finding" data-severity="resolved">
+            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Application-list failures have a clear recoverable state</span><span></span></summary>
+            <div class="finding-body"><p><strong>Remediation:</strong> application data, loading status, and load errors are now tracked separately. Home and Applications render an explicit unavailable state with a Retry action instead of an empty workspace when the list request fails.</p><div class="refs"><span class="path">src/main.jsx</span></div></div>
           </details>
         </section>
 
@@ -219,24 +220,21 @@
         </section>
 
         <section class="card" id="repair">
-          <h2>Recommended repair sequence</h2>
-          <p class="lede">This order reduces user-visible correctness risk first, then makes the system easier to scale and maintain.</p>
+          <h2>Remaining repair sequence</h2>
+          <p class="lede">All critical and high-priority findings above are resolved. This order addresses the remaining correctness and maintainability work.</p>
           <ol class="repair">
-            <li><b>Separate long-running work from the global barrier.</b> Narrow SQLite/file locks, add bounded provider/render execution, and preserve run status on timeout/failure.</li>
-            <li><b>Make application data freshness explicit.</b> Version or invalidate analyses/proposals when job descriptions change; require current inputs at proposal and generation boundaries.</li>
-            <li><b>Repair startup and local development paths.</b> Handle a missing checkpoints directory and make <code>npm run dev:backend</code> select the project virtualenv/cwd consistently.</li>
             <li><b>Harden PATCH and conflict semantics.</b> Use true partial-update schemas, validate required fields, and translate uniqueness/integrity failures into stable client errors.</li>
-            <li><b>Fix frontend state handling.</b> Centralize/disable duplicate actions, add idempotency keys, preserve load errors, and implement server-side pagination/search.</li>
+            <li><b>Complete frontend list scalability.</b> Implement server-side pagination/search while preserving total and result state.</li>
             <li><b>Reduce query and migration coupling.</b> Batch evidence/source reads, adopt versioned migrations, split the backend module by domain, and pin dependencies.</li>
-            <li><b>Add regression coverage.</b> Cover stale-analysis invalidation, timeout cleanup, fresh-clone startup, PATCH omission semantics, pagination/error states, and an end-to-end happy path.</li>
+            <li><b>Add regression coverage.</b> Cover compiler timeout cleanup, fresh-clone startup, PATCH omission semantics, pagination/error states, and an end-to-end happy path.</li>
           </ol>
         </section>
 
         <section class="card" id="scope">
           <h2>Scope, assumptions, and handoff</h2>
           <p>This review deliberately excludes visual design, styling, layout, typography, animation, and other appearance-based concerns. It focuses on file/code structure, functional correctness, errors, runtime efficiency, data freshness, startup behavior, and operational exposure.</p>
-          <p>Findings are based on the repository state and verification results available during the review. Line references identify the reviewed locations; they may shift after code edits. No application source files were changed to produce this report.</p>
-          <p><strong>Suggested next handoff:</strong> address the first five repair steps, then rerun the backend suite, frontend build, and a browser/API smoke path before expanding the refactor.</p>
+          <p>Findings are based on the repository state and verification results available during the review. The request-isolation finding was rechecked after remediation; line references identify the current reviewed locations and may shift after later edits.</p>
+          <p><strong>Suggested next handoff:</strong> address the remaining medium-priority repair steps, then rerun the backend suite, frontend build, and a browser/API smoke path before expanding the refactor.</p>
         </section>
       </main>
     </div>
