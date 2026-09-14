@@ -47,6 +47,23 @@ def _enable_sqlite_foreign_keys(connection, _record):
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 def now(): return datetime.now(timezone.utc)
+
+
+def _job_description_fingerprint(job_description: str) -> str:
+    """Return a deterministic identity for the exact saved job description.
+
+    Job descriptions are user-authored text.  Hashing the exact UTF-8 value
+    means even a small edit (including whitespace or punctuation) creates a
+    new analysis/proposal generation context, while keeping the persisted
+    linkage compact and safe to compare across requests.
+    """
+    return hashlib.sha256(job_description.encode("utf-8")).hexdigest()
+
+
+class JobDescriptionChanged(Exception):
+    """Raised when a provider result was produced for an obsolete JD."""
+
+
 class Base(DeclarativeBase): pass
 class ContentItem(Base):
     __tablename__="content_items"
@@ -116,7 +133,7 @@ class BaseEntry(Base):
     id: Mapped[int]=mapped_column(primary_key=True); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); content_item_id: Mapped[int]=mapped_column(ForeignKey("content_items.id")); selected_bullet_ids: Mapped[list]=mapped_column(JSON,default=list); entry_order: Mapped[int]=mapped_column(Integer,default=0)
 class Application(Base):
     __tablename__="applications"
-    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); source: Mapped[str|None]=mapped_column(String(120)); location: Mapped[str|None]=mapped_column(String(200)); employment_type: Mapped[str|None]=mapped_column(String(80)); salary_range: Mapped[str|None]=mapped_column(String(120)); contact_name: Mapped[str|None]=mapped_column(String(200)); contact_email: Mapped[str|None]=mapped_column(String(320)); application_deadline: Mapped[str|None]=mapped_column(String(40)); applied_at: Mapped[str|None]=mapped_column(String(40)); follow_up_at: Mapped[str|None]=mapped_column(String(40)); submitted_revision_id: Mapped[int|None]=mapped_column(ForeignKey("revisions.id"),nullable=True); submitted_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
+    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); job_description_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False); job_description_fingerprint: Mapped[str]=mapped_column(String(64),default="",nullable=False); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); source: Mapped[str|None]=mapped_column(String(120)); location: Mapped[str|None]=mapped_column(String(200)); employment_type: Mapped[str|None]=mapped_column(String(80)); salary_range: Mapped[str|None]=mapped_column(String(120)); contact_name: Mapped[str|None]=mapped_column(String(200)); contact_email: Mapped[str|None]=mapped_column(String(320)); application_deadline: Mapped[str|None]=mapped_column(String(40)); applied_at: Mapped[str|None]=mapped_column(String(40)); follow_up_at: Mapped[str|None]=mapped_column(String(40)); submitted_revision_id: Mapped[int|None]=mapped_column(ForeignKey("revisions.id"),nullable=True); submitted_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
 class ApplicationStatusHistory(Base):
     __tablename__="application_status_history"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); from_status: Mapped[str|None]=mapped_column(String(30),nullable=True); to_status: Mapped[str]=mapped_column(String(30)); reason: Mapped[str|None]=mapped_column(Text,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
@@ -126,7 +143,7 @@ class ApplicationStatusHistory(Base):
     def changed_at(self): return self.created_at
 class JobAnalysis(Base):
     __tablename__="job_analyses"
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); requirements: Mapped[list]=mapped_column(JSON); keywords: Mapped[list]=mapped_column(JSON); technologies: Mapped[list]=mapped_column(JSON); responsibilities: Mapped[list]=mapped_column(JSON); preferred_qualifications: Mapped[list]=mapped_column(JSON); schema_version: Mapped[str]=mapped_column(String(40),default="2.0"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); job_description_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False); job_description_fingerprint: Mapped[str]=mapped_column(String(64),default="",nullable=False); is_current: Mapped[bool]=mapped_column(Boolean,default=True,nullable=False); requirements: Mapped[list]=mapped_column(JSON); keywords: Mapped[list]=mapped_column(JSON); technologies: Mapped[list]=mapped_column(JSON); responsibilities: Mapped[list]=mapped_column(JSON); preferred_qualifications: Mapped[list]=mapped_column(JSON); schema_version: Mapped[str]=mapped_column(String(40),default="2.0"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 class JobRequirement(Base):
     """A durable, application-scoped requirement extracted from a job.
 
@@ -754,6 +771,10 @@ def _apply_sqlite_integrity_migrations() -> None:
         # which preserves all existing rows and is safe to repeat when guarded
         # by an inspector check.
         columns = {
+            "job_url": "VARCHAR(500)",
+            "notes": "TEXT",
+            "job_description_version": "INTEGER NOT NULL DEFAULT 1",
+            "job_description_fingerprint": "VARCHAR(64) NOT NULL DEFAULT ''",
             "source": "VARCHAR(120)",
             "location": "VARCHAR(200)",
             "employment_type": "VARCHAR(80)",
@@ -777,8 +798,19 @@ def _apply_sqlite_integrity_migrations() -> None:
         if "generated_at" not in revision_columns:
             connection.execute(text("ALTER TABLE revisions ADD COLUMN generated_at DATETIME"))
         analysis_columns = {column["name"] for column in inspect(connection).get_columns("job_analyses")}
+        if "job_description_version" not in analysis_columns:
+            connection.execute(text("ALTER TABLE job_analyses ADD COLUMN job_description_version INTEGER NOT NULL DEFAULT 1"))
+        if "job_description_fingerprint" not in analysis_columns:
+            connection.execute(text("ALTER TABLE job_analyses ADD COLUMN job_description_fingerprint VARCHAR(64) NOT NULL DEFAULT ''"))
+        if "is_current" not in analysis_columns:
+            connection.execute(text("ALTER TABLE job_analyses ADD COLUMN is_current BOOLEAN NOT NULL DEFAULT 1"))
         if "schema_version" not in analysis_columns:
             connection.execute(text("ALTER TABLE job_analyses ADD COLUMN schema_version VARCHAR(40) DEFAULT '1.0'"))
+        proposal_columns = {column["name"] for column in inspect(connection).get_columns("proposals")}
+        if "job_description_version" not in proposal_columns:
+            connection.execute(text("ALTER TABLE proposals ADD COLUMN job_description_version INTEGER NOT NULL DEFAULT 1"))
+        if "job_description_fingerprint" not in proposal_columns:
+            connection.execute(text("ALTER TABLE proposals ADD COLUMN job_description_fingerprint VARCHAR(64) NOT NULL DEFAULT ''"))
         confirmation_columns = {column["name"] for column in inspect(connection).get_columns("missing_confirmations")}
         if "requirement_id" not in confirmation_columns:
             connection.execute(text("ALTER TABLE missing_confirmations ADD COLUMN requirement_id INTEGER"))
@@ -1238,16 +1270,16 @@ class PersonalInformationOut(APIOut):
 class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]; personal_information_id:int|None
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
 class ApplicationOut(APIOut):
-    id:int; company:str; position:str; job_url:str|None; job_description:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
+    id:int; company:str; position:str; job_url:str|None; job_description:str; job_description_version:int; job_description_fingerprint:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
 class StatusHistoryOut(APIOut):
     id:int; application_id:int; from_status:str|None; to_status:str; status:str; reason:str|None; created_at:datetime; changed_at:datetime
 class JobAnalysisOut(APIOut):
-    id:int; application_id:int; schema_version:str="2.0"; requirements:list[dict[str,Any]]; requirement_texts:list[str]=Field(default_factory=list); keywords:list[str]; technologies:list[str]; responsibilities:list[str]; preferred_qualifications:list[str]; created_at:datetime
+    id:int; application_id:int; job_description_version:int; job_description_fingerprint:str; is_current:bool; schema_version:str="2.0"; requirements:list[dict[str,Any]]; requirement_texts:list[str]=Field(default_factory=list); keywords:list[str]; technologies:list[str]; responsibilities:list[str]; preferred_qualifications:list[str]; created_at:datetime
 class EvidenceLinkOut(APIOut):
     id:int; requirement_id:int; source_type:str; source_id:int|None=None; content_item_id:int|None; bullet_id:int|None; skill_id:int|None; excerpt:str|None; note:str|None; source:dict[str,Any]|None=None; created_at:datetime
 class JobRequirementOut(APIOut):
     id:int; requirement_id:int; key:str; requirement_key:str; stable_id:str; text:str; requirement:str; category:str; kind:str; requirement_type:str; priority:str; importance:str; source_text:str|None; is_active:bool; evidence_links:list[EvidenceLinkOut]=Field(default_factory=list); evidence:list[EvidenceLinkOut]=Field(default_factory=list); created_at:datetime; updated_at:datetime
-class ProposalOut(APIOut): id:int; application_id:int; payload:dict[str,Any]; status:str; created_at:datetime
+class ProposalOut(APIOut): id:int; application_id:int; job_description_version:int; job_description_fingerprint:str; payload:dict[str,Any]; status:str; created_at:datetime
 class RevisionOut(APIOut):
     id:int; application_id:int; revision_number:int; resume_json:dict[str,Any]; latex_path:str|None; pdf_path:str|None; page_count:int|None; status:str; generated_at:datetime|None; created_at:datetime
 class RevisionReferenceOut(APIOut):
@@ -1856,6 +1888,25 @@ def _transition_application(application:Application, to_status:str, s:Session, *
     s.add(event_record)
     return event_record
 
+
+def _invalidate_job_description_dependents(application: Application, s: Session, new_job_description: str) -> None:
+    """Advance a JD identity and invalidate all derived optimization data."""
+    current_version, _ = _application_job_description_identity(application)
+    application.job_description_version = current_version + 1
+    application.job_description_fingerprint = _job_description_fingerprint(new_job_description)
+    for analysis in s.query(JobAnalysis).filter_by(application_id=application.id).all():
+        analysis.is_current = False
+    # ``stale`` is intentionally distinct from ``pending``: it tells the UI
+    # that user approval existed, but is no longer valid for this JD.
+    s.query(Proposal).filter_by(application_id=application.id).update(
+        {"status": "stale"}, synchronize_session=False
+    )
+    # Requirement rows are durable audit records, but their active projection
+    # must not be used until a fresh analysis has been produced.
+    s.query(JobRequirement).filter_by(application_id=application.id).update(
+        {"is_active": False}, synchronize_session=False
+    )
+
 def _submittable_revision(application_id:int, revision_id:int, s:Session) -> Revision:
     revision=s.get(Revision,revision_id)
     if not revision:
@@ -1903,7 +1954,9 @@ def add_app(x:AppIn,s:Session=Depends(db)):
     requested_status=values.pop("status")
     # applied_at is lifecycle-managed; callers may not seed or override it.
     values.pop("applied_at",None)
-    o=Application(**values,status="draft"); s.add(o); s.flush()
+    o=Application(**values,status="draft",
+        job_description_version=1,
+        job_description_fingerprint=_job_description_fingerprint(values["job_description"])); s.add(o); s.flush()
     _transition_application(o,requested_status,s,reason="application created",initial=True)
     s.commit(); s.refresh(o); return o
 @app.get("/applications",response_model=list[ApplicationOut])
@@ -1944,6 +1997,8 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
     if submitted_revision_id is not None:
         revision_to_submit=_submittable_revision(id,submitted_revision_id,s)
         _submit_revision(o,revision_to_submit,s)
+    if "job_description" in changes and changes["job_description"] != o.job_description:
+        _invalidate_job_description_dependents(o, s, changes["job_description"])
     for key,value in changes.items():
         if key != "status": setattr(o,key,value)
     if "status" in changes:
@@ -1991,6 +2046,31 @@ def _provider_call(provider, operation, payload):
 def _run_error(exc):
     if isinstance(exc, CodexProviderError): return str(exc)[:2000]
     return "Unexpected Codex provider failure"
+
+
+def _application_job_description_identity(application: Application) -> tuple[int, str]:
+    """Return the durable JD version/fingerprint, repairing legacy blanks."""
+    version = application.job_description_version or 1
+    fingerprint = application.job_description_fingerprint or _job_description_fingerprint(application.job_description)
+    return version, fingerprint
+
+
+def _current_job_analysis(application: Application, s: Session) -> JobAnalysis | None:
+    """Find an analysis tied to the application's exact current JD."""
+    version, fingerprint = _application_job_description_identity(application)
+    return s.query(JobAnalysis).filter(
+        JobAnalysis.application_id == application.id,
+        JobAnalysis.is_current.is_(True),
+        JobAnalysis.job_description_version == version,
+        JobAnalysis.job_description_fingerprint == fingerprint,
+    ).order_by(JobAnalysis.created_at.desc(), JobAnalysis.id.desc()).first()
+
+
+def _require_current_job_analysis(application: Application, s: Session) -> JobAnalysis:
+    analysis = _current_job_analysis(application, s)
+    if analysis is None:
+        raise HTTPException(409, "job description changed; analyze application again")
+    return analysis
 
 
 def _item_skill_links(item_ids:list[int], s:Session) -> dict[int,list[ContentItemSkill]]:
@@ -2243,7 +2323,22 @@ def analyze(id:int, request:OptimizationRequest|None=None, idempotency_key: str|
             if payload and payload["normalized_key"] not in seen_keys:
                 normalized_requirements.append(payload); seen_keys.add(payload["normalized_key"])
         with SessionLocal() as write_session:
-            o=JobAnalysis(application_id=id,requirements=normalized_requirements,
+            current_application=write_session.get(Application,id)
+            current_version, current_fingerprint = _application_job_description_identity(current_application)
+            if (current_version != job_description_version
+                    or current_fingerprint != job_description_fingerprint
+                    or current_application.job_description != job_description):
+                run=write_session.get(OptimizationRun,run_id)
+                run.status="failed"; run.error="job description changed while analysis was running"; run.completed_at=now(); write_session.commit()
+                raise JobDescriptionChanged("job description changed while analysis was running; analyze again")
+            write_session.query(JobAnalysis).filter_by(application_id=id).update(
+                {"is_current":False}, synchronize_session=False
+            )
+            o=JobAnalysis(application_id=id,
+                job_description_version=job_description_version,
+                job_description_fingerprint=job_description_fingerprint,
+                is_current=True,
+                requirements=normalized_requirements,
                 keywords=fields["keywords"],technologies=fields["technologies"],
                 responsibilities=fields["responsibilities"],preferred_qualifications=fields["preferred_qualifications"],
                 schema_version=SCHEMA_VERSION); write_session.add(o); write_session.flush()
@@ -2261,6 +2356,8 @@ def analyze(id:int, request:OptimizationRequest|None=None, idempotency_key: str|
             run=write_session.get(OptimizationRun,run_id)
             run.status="succeeded"; run.output_payload={"id":o.id,**fields,
                 "requirements":[{"id":row.id,"text":row.text,"category":row.category} for row in rows]}; run.completed_at=now(); write_session.commit(); write_session.refresh(o); return _analysis_response(o,write_session)
+    except JobDescriptionChanged as exc:
+        raise HTTPException(409,str(exc))
     except Exception as exc:
         with SessionLocal() as write_session:
             run=write_session.get(OptimizationRun,run_id)
@@ -2268,16 +2365,18 @@ def analyze(id:int, request:OptimizationRequest|None=None, idempotency_key: str|
         raise HTTPException(503,"Codex provider unavailable: "+_run_error(exc))
 @app.get("/applications/{id}/analysis",response_model=JobAnalysisOut)
 def get_analysis(id:int,s:Session=Depends(db)):
-    if not s.get(Application,id): raise HTTPException(404,"application not found")
-    o=s.query(JobAnalysis).filter_by(application_id=id).order_by(JobAnalysis.created_at.desc()).first()
+    application=s.get(Application,id)
+    if not application: raise HTTPException(404,"application not found")
+    o=_current_job_analysis(application,s)
     if not o: raise HTTPException(404,"analysis not found")
     return _analysis_response(o,s)
 @app.post("/applications/{id}/proposals/generate",response_model=ProposalOut)
 def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
-    analysis=s.query(JobAnalysis).filter_by(application_id=id).order_by(JobAnalysis.created_at.desc()).first()
-    if not analysis: raise HTTPException(404,"analyze application first")
+    analysis=_current_job_analysis(a,s)
+    if not analysis: raise HTTPException(409,"job description changed; analyze application again")
+    job_description_version, job_description_fingerprint = _application_job_description_identity(a)
     key=request.idempotency_key if request else None
     if key:
         prior=s.query(OptimizationRun).filter_by(application_id=id,operation="proposal",idempotency_key=key).first()
@@ -2287,6 +2386,8 @@ def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=
     context=_verified_context(a,s)
     payload={"analysis":{k:getattr(analysis,k) for k in ("requirements","keywords","technologies","responsibilities","preferred_qualifications")},
         "analysis_schema_version":analysis.schema_version or "1.0",
+        "job_description_version":job_description_version,
+        "job_description_fingerprint":job_description_fingerprint,
         **context,"confirmations":[{"requirement_id":x.requirement_id,"requirement":x.requirement,"status":x.status,"context":x.context}
         for x in s.query(MissingConfirmation).filter_by(application_id=id)]}
     run=OptimizationRun(application_id=id,operation="proposal",idempotency_key=key,input_payload=payload,model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
@@ -2302,16 +2403,31 @@ def generate_proposals(id:int, request:OptimizationRequest|None=None, s:Session=
             "schema_version":SCHEMA_VERSION}
         with SessionLocal() as write_session:
             current_application=write_session.get(Application,id)
+            current_version, current_fingerprint = _application_job_description_identity(current_application)
+            current_analysis=_current_job_analysis(current_application,write_session)
+            if (current_version != job_description_version
+                    or current_fingerprint != job_description_fingerprint
+                    or current_analysis is None
+                    or current_analysis.id != analysis.id):
+                run=write_session.get(OptimizationRun,run_id)
+                run.status="failed"; run.error="job description changed while proposal was running"; run.completed_at=now(); write_session.commit()
+                raise JobDescriptionChanged("job description changed while proposal was running; generate again")
             _validate_proposal_payload(current_application,out,write_session)
             # Reuse the existing proposal validation gates before persistence.
-            p=Proposal(application_id=id,payload=out); write_session.add(p); write_session.flush()
+            p=Proposal(application_id=id,
+                job_description_version=job_description_version,
+                job_description_fingerprint=job_description_fingerprint,
+                payload=out); write_session.add(p); write_session.flush()
             run=write_session.get(OptimizationRun,run_id)
             run.status="succeeded"; run.output_payload={"id":p.id,**out}; run.completed_at=now(); write_session.commit(); write_session.refresh(p); return p
+    except JobDescriptionChanged as exc:
+        raise HTTPException(409,str(exc))
     except ValidationError as exc:
         with SessionLocal() as write_session:
             run=write_session.get(OptimizationRun,run_id)
             run.status="failed"; run.error=str(exc)[:2000]; run.completed_at=now(); write_session.commit()
-        raise HTTPException(422,str(exc))
+        code=409 if "job description" in str(exc) else 422
+        raise HTTPException(code,str(exc))
     except Exception as exc:
         with SessionLocal() as write_session:
             run=write_session.get(OptimizationRun,run_id)
@@ -3076,13 +3192,17 @@ def materialize_application_confirmation_alias(id:int,confirmation_id:int,x:Sour
 def proposal(id:int,x:ProposalIn,s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
+    job_description_version, job_description_fingerprint = _application_job_description_identity(a)
     context=_verified_context(a,s)
     p={**x.payload,"source_fingerprint":context["source_fingerprint"],
         "prompt_version":x.payload.get("prompt_version",PROMPT_VERSION),
         "schema_version":x.payload.get("schema_version",SCHEMA_VERSION)}
     try: _validate_proposal_payload(a,p,s)
     except ValidationError as exc: raise HTTPException(422,str(exc))
-    o=Proposal(application_id=id,payload=p); s.add(o); s.commit(); s.refresh(o); return o
+    o=Proposal(application_id=id,
+        job_description_version=job_description_version,
+        job_description_fingerprint=job_description_fingerprint,
+        payload=p); s.add(o); s.commit(); s.refresh(o); return o
 @app.post("/proposals/{id}/approve",response_model=ProposalOut)
 def approve(id:int,s:Session=Depends(db)):
     o=s.get(Proposal,id)
@@ -3090,8 +3210,10 @@ def approve(id:int,s:Session=Depends(db)):
     a=s.get(Application,o.application_id)
     try: _validate_proposal_payload(a,o.payload,s)
     except ValidationError as exc:
-        status=409 if "source data changed" in str(exc) else 422
+        status=409 if "source data changed" in str(exc) or "job description" in str(exc) else 422
         raise HTTPException(status,str(exc))
+    try: _ensure_proposal_current(a,o)
+    except ValidationError as exc: raise HTTPException(409,str(exc))
     try:
         # Approval is the last point a user can rely on a proposal being
         # executable.  Do this before changing its status, not only at PDF
@@ -3108,9 +3230,11 @@ def proposal_decision(id:int, decision:dict, s:Session=Depends(db)):
     if status not in {'approved','rejected','pending'}: raise HTTPException(422,"invalid proposal status")
     if status=='approved':
         a=s.get(Application,o.application_id)
-        try: _validate_proposal_payload(a,o.payload,s)
+        try:
+            _ensure_proposal_current(a,o)
+            _validate_proposal_payload(a,o.payload,s)
         except ValidationError as exc:
-            code=409 if "source data changed" in str(exc) else 422
+            code=409 if "source data changed" in str(exc) or "job description" in str(exc) else 422
             raise HTTPException(code,str(exc))
         try: build_snapshot(a,s,o.payload,o.id)
         except ValidationError as exc: raise HTTPException(422,str(exc))
@@ -3346,10 +3470,11 @@ def generate(id:int,x:GenerateIn,s:Session=Depends(db)):
     if proposal.application_id!=id: raise HTTPException(422,"proposal does not belong to application")
     if proposal.status!="approved": raise HTTPException(409,"proposal must be approved before generation")
     try:
+        _ensure_proposal_current(a,proposal)
         _validate_proposal_payload(a,proposal.payload,s)
         snap=build_snapshot(a,s,proposal.payload,proposal.id)
     except ValidationError as exc:
-        code=409 if "source data changed" in str(exc) else 422
+        code=409 if "source data changed" in str(exc) or "job description" in str(exc) else 422
         raise HTTPException(code,str(exc))
     o=_reserve_revision(id,snap,s,status="generating")
     revision_id=o.id
