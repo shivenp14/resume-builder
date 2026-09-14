@@ -510,6 +510,9 @@ def _analysis_response(analysis: JobAnalysis, s: Session) -> dict[str,Any]:
     return {
         "id": analysis.id,
         "application_id": analysis.application_id,
+        "job_description_version": analysis.job_description_version,
+        "job_description_fingerprint": analysis.job_description_fingerprint,
+        "is_current": bool(analysis.is_current),
         "schema_version": analysis.schema_version or "1.0",
         "requirements": [_requirement_response(row, s) for row in rows],
         "requirement_texts": [row.text for row in rows],
