@@ -205,7 +205,7 @@ RequirementEvidence = RequirementEvidenceLink
 JobRequirementLink = RequirementEvidenceLink
 class Proposal(Base):
     __tablename__="proposals"
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); payload: Mapped[dict]=mapped_column(JSON); status: Mapped[str]=mapped_column(String(20),default="pending"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); job_description_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False); job_description_fingerprint: Mapped[str]=mapped_column(String(64),default="",nullable=False); payload: Mapped[dict]=mapped_column(JSON); status: Mapped[str]=mapped_column(String(20),default="pending"); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
 class Revision(Base):
     __tablename__="revisions"
     __table_args__=(UniqueConstraint("application_id", "revision_number", name="uq_revision_application_number"),)
@@ -2135,7 +2135,9 @@ def _verified_context(a:Application,s:Session) -> dict[str,Any]:
         "personal_information_id":base.personal_information_id,"contact":canonical_contact},
         "base_entries":[{"content_item_id":entry.content_item_id,"bullet_ids":entry.selected_bullet_ids,
             "entry_order":entry.entry_order} for entry in entries],**verified}
-    analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
+    # Stale analyses remain in the audit trail but must never contribute
+    # requirements to a new proposal after the JD changes.
+    analysis=_current_job_analysis(a,s)
     requirement_rows=_analysis_requirement_rows(analysis,s,reactivate=False) if analysis else []
     # Providers receive requirement-scoped links with stable source
     # identifiers, types, and any human context attached to the link. The
@@ -2274,25 +2276,46 @@ def _validate_proposal_payload(a:Application,payload:dict,s:Session,*,require_fr
             if types.get(entry["content_item_id"]) in {"education","activities"}}
         missing=required-set(selected_ids)
         if missing: raise ValidationError(f"proposal omits required base entry {min(missing)}")
-    if require_fresh and payload.get("source_fingerprint") != context["source_fingerprint"]:
-        raise ValidationError("proposal source data changed; generate a new proposal")
+    if require_fresh:
+        if payload.get("source_fingerprint") != context["source_fingerprint"]:
+            raise ValidationError("proposal source data changed; generate a new proposal")
     return context
 
+
+def _ensure_proposal_current(application: Application, proposal: Proposal) -> None:
+    version, fingerprint = _application_job_description_identity(application)
+    if (proposal.job_description_version != version
+            or proposal.job_description_fingerprint != fingerprint):
+        raise ValidationError("job description changed; generate a new proposal")
+
 @app.post("/applications/{id}/analyze",response_model=JobAnalysisOut)
-def analyze(id:int, request:OptimizationRequest|None=None, idempotency_key: str|None=Header(default=None, alias="Idempotency-Key"), s:Session=Depends(db)):
+def analyze(
+    id: int,
+    request: OptimizationRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    s: Session = Depends(db),
+):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")
-    body_key=request.idempotency_key if request else None
+    job_description=a.job_description
+    job_description_version, job_description_fingerprint = _application_job_description_identity(a)
+    body_key = request.idempotency_key if request else None
     if body_key and idempotency_key and body_key != idempotency_key:
-        raise HTTPException(400,"idempotency key must match the Idempotency-Key header")
-    key=idempotency_key or body_key
+        raise HTTPException(400, "idempotency key must match the Idempotency-Key header")
+    key = idempotency_key or body_key
     if key:
         prior=s.query(OptimizationRun).filter_by(application_id=id,operation="analysis",idempotency_key=key).first()
         if prior and prior.status=="succeeded" and prior.output_payload:
             existing=s.get(JobAnalysis,prior.output_payload.get("id"))
-            if existing: return _analysis_response(existing,s)
-    job_description=a.job_description
-    run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,input_payload={"job_description":job_description},model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
+            if (existing
+                    and existing.job_description_version == job_description_version
+                    and existing.job_description_fingerprint == job_description_fingerprint):
+                return _analysis_response(existing,s)
+    run=OptimizationRun(application_id=id,operation="analysis",idempotency_key=key,
+        input_payload={"job_description":job_description,
+                       "job_description_version":job_description_version,
+                       "job_description_fingerprint":job_description_fingerprint},
+        model=MODEL,reasoning_effort=REASONING,prompt_version=PROMPT_VERSION,schema_version=SCHEMA_VERSION); s.add(run); s.commit()
     run_id=run.id
     # Do not retain a SQLite transaction while the provider can take minutes.
     s.close()
@@ -2532,8 +2555,8 @@ def delete_requirement_evidence(link_id:int,s:Session=Depends(db)):
     s.delete(link); s.commit(); return {"deleted":True}
 
 def _comparison(a:Application,s:Session):
-    analysis=s.query(JobAnalysis).filter_by(application_id=a.id).order_by(JobAnalysis.created_at.desc()).first()
-    if not analysis: raise HTTPException(404,"analyze application first")
+    analysis=_current_job_analysis(a,s)
+    if not analysis: raise HTTPException(409,"job description changed; analyze application again")
     rows=_analysis_requirement_rows(analysis,s,reactivate=False)
     # Technology terms retain the concise legacy comparison display (for
     # example ``docker``), while prose requirements remain structured rows.
