@@ -31,7 +31,7 @@ from .services.matching import (
 )
 from .services.backup import BackupError, create_backup as create_backup_archive, list_backups as list_backup_archives
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("RESUME_WORKSPACE_ROOT", Path(__file__).resolve().parents[2])).resolve()
 DB_PATH = ROOT / "data" / "app.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
@@ -3388,7 +3388,7 @@ def _reserve_revision(application_id:int, snapshot:dict[str,Any], s:Session, *, 
         except IntegrityError:
             s.rollback()
     raise HTTPException(409,"could not allocate a unique revision number; retry the request")
-@app.get("/applications/{id}/snapshot",response_model=SnapshotOut)
+@app.get("/applications/{id}/snapshot",response_model=SnapshotOut,response_model_exclude_unset=True)
 def snapshot(id:int,s:Session=Depends(db)):
     a=s.get(Application,id)
     if not a: raise HTTPException(404,"application not found")

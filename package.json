@@ -8,13 +8,17 @@
     "dev:frontend": "vite",
     "dev:backend": "node scripts/dev-backend.mjs",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:ui": "playwright test",
+    "test:ui:headed": "playwright test --headed"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "vite": "latest"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
 }

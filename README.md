@@ -31,11 +31,10 @@ Content-Type: application/json
 Generation materializes an immutable tailored snapshot; it never edits the
 verified content library or base resume records.
 
-Frontend development is intentionally deferred. The current project scope is
-the backend data model, API contracts, validation, matching, revision history,
-and rendering every resume through the canonical baseline LaTeX template to
-PDF. The supplied baseline resume was a one-time curated initialization; a
-general PDF, DOCX, or pasted-text ingestion pipeline is out of scope.
+The React workspace includes application, source-library, skill, profile,
+base-resume, revision, and backup flows. Resume rendering uses the canonical
+baseline LaTeX template. General PDF, DOCX, or pasted-text ingestion remains
+out of scope.
 
 ## Run the frontend and API
 
@@ -84,6 +83,30 @@ From the repository root:
 ```bash
 backend/.venv/bin/python -m pytest -q
 ```
+
+## Browser flow tests
+
+Install the test browser once, then run the desktop and mobile suites:
+
+```bash
+npx playwright install chromium
+npm run test:ui
+```
+
+Tests start their own Vite server on port 5174 and API on port 8011. Each run
+uses a temporary workspace and a deterministic AI provider; saved local records
+and Codex sessions are untouched. PDF tests use the real LaTeX renderer and
+require `latexmk`. To watch the tests, run `npm run test:ui:headed`.
+
+Coverage includes application creation/search/filtering, analysis failure and
+retry, source/bullet editing, archive/restore, skills and aliases, profiles,
+base-resume entries, confirmation materialization, proposals, PDF/LaTeX links,
+exact-revision submission, comparison, backups, validation errors, and mobile
+keyboard navigation with reduced motion. Failure traces and screenshots are
+saved in `test-results/`.
+
+The API accepts `RESUME_WORKSPACE_ROOT` to isolate database and artifact storage;
+without it, storage remains in the repository as before.
 
 ## Seed checkpoint data
 

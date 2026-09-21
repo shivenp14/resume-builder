@@ -1,28 +1,15 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { SuccessNotice } from './feedback.jsx';
 
 /**
  * Application workflow components.
  *
- * These components intentionally keep their own API helper so they can be
- * mounted into the existing shell without coupling the shell to this module.
+ * Requests share the same API helper and readable validation errors.
  * The API returns source-backed records only; this UI does not invent scores
  * or aggregate statistics.
  */
-export const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000';
-
-export async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(data.detail || data.message || `Request failed (${response.status})`);
-    error.status = response.status;
-    throw error;
-  }
-  return data;
-}
+import { API_BASE, request as apiRequest } from './api.js';
+export { API_BASE, apiRequest };
 
 function jsonBody(value) {
   return JSON.stringify(value);
@@ -36,7 +23,7 @@ function idempotencyKey(prefix) {
 }
 
 function ActionButton({ children, onClick, disabled = false, kind = 'primary', type = 'button' }) {
-  return <button className={`button ${kind}`} type={type} onClick={onClick} disabled={disabled}>{children}</button>;
+  return <button className={`button ${kind}`} type={type} onClick={onClick} disabled={disabled} aria-busy={Boolean(disabled && typeof children === 'string' && children.endsWith('…'))}>{children}</button>;
 }
 
 function Panel({ children, className = '' }) {
@@ -48,7 +35,7 @@ function WorkflowError({ error }) {
 }
 
 function Status({ value }) {
-  return <span className="status-pill">{value || 'unknown'}</span>;
+  return <span key={value} className="status-pill" data-state={value}>{value || 'unknown'}</span>;
 }
 
 function useAsyncLoader(loader, dependencies) {
@@ -118,7 +105,7 @@ function SourceRecordForm({ onSubmit, busy }) {
         <label>Tags<input value={form.tags} onChange={event => set('tags', event.target.value)} placeholder="Comma separated" /></label>
       </>}
     </div>
-    <div className="form-actions"><ActionButton disabled={busy}>{busy ? 'Materializing…' : 'Materialize source record'}</ActionButton></div>
+    <div className="form-actions"><ActionButton type="submit" disabled={busy}>{busy ? 'Materializing…' : 'Materialize source record'}</ActionButton></div>
   </form>;
 }
 
@@ -171,7 +158,7 @@ export function MissingConfirmations({ applicationId, onChanged }) {
       {!confirmations.length ? <p>No confirmation records yet. Create them from the current unsupported requirements.</p> : <div className="application-list">
         {confirmations.map(confirmation => <Panel className="list-card" key={confirmation.id}>
           <div className="section-head"><div><b>{confirmation.requirement}</b><small>Requirement {confirmation.requirement_id || 'without stable ID'}</small></div><Status value={confirmation.status} /></div>
-          {confirmation.source_record && <p>Source record attached.</p>}
+          {confirmation.source_record && <SuccessNotice>Source record attached.</SuccessNotice>}
           <div className="form-actions">
             <ActionButton kind="ghost" disabled={busyId === confirmation.id || confirmation.status === 'confirmed'} onClick={() => decide(confirmation, 'confirmed')}>Confirm</ActionButton>
             <ActionButton kind="ghost" disabled={busyId === confirmation.id || confirmation.status === 'rejected'} onClick={() => decide(confirmation, 'rejected')}>Reject</ActionButton>
@@ -213,7 +200,7 @@ export function ProposalWorkflow({ applicationId, onChanged }) {
     finally { setBusy(''); }
   };
   if (loading) return <Panel><p>Loading proposals…</p></Panel>;
-  return <Panel>
+  return <Panel className="workflow-stage">
     <div className="section-head"><div><h2>Proposal review</h2><p>Generated selections remain proposals until you approve them against current source data.</p></div><ActionButton onClick={generate} disabled={busy === 'generate'}>{busy === 'generate' ? 'Generating…' : 'Generate proposal'}</ActionButton></div>
     <WorkflowError error={error || loadError} />
     {!rows.length ? <p>No proposals yet. Generate one after analysis is complete.</p> : <div className="application-list">{rows.map(proposal => {
@@ -247,11 +234,14 @@ export function SnapshotGenerationSubmit({ applicationId, onChanged }) {
   const [busy, setBusy] = useState('');
   const approved = (proposalState.data || []).filter(proposal => proposal.status === 'approved');
   const [proposalId, setProposalId] = useState('');
+  const [generatedArtifacts, setGeneratedArtifacts] = useState({});
+  const [submittedId, setSubmittedId] = useState(null);
+  const [notice, setNotice] = useState('');
   const revisions = revisionState.data || [];
   const generate = async () => {
     if (!proposalId) { setError('Select an approved proposal before generating.'); return; }
     setBusy('generate'); setError('');
-    try { await apiRequest(`/applications/${applicationId}/generate`, { method: 'POST', body: jsonBody({ proposal_id: Number(proposalId) }) }); await revisionState.reload(); onChanged?.(); }
+    try { const generated = await apiRequest(`/applications/${applicationId}/generate`, { method: 'POST', body: jsonBody({ proposal_id: Number(proposalId) }) }); setGeneratedArtifacts(current => ({ ...current, [generated.id]: generated })); setNotice(`Revision ${generated.revision_number} generated.`); await revisionState.reload(); onChanged?.(); }
     catch (err) { setError(err.message); }
     finally { setBusy(''); }
   };
@@ -264,16 +254,17 @@ export function SnapshotGenerationSubmit({ applicationId, onChanged }) {
   };
   const submit = async revision => {
     setBusy(`submit-${revision.id}`); setError('');
-    try { await apiRequest(`/applications/${applicationId}/submit`, { method: 'POST', body: jsonBody({ revision_id: revision.id }) }); await revisionState.reload(); onChanged?.(); }
+    try { await apiRequest(`/applications/${applicationId}/submit`, { method: 'POST', body: jsonBody({ revision_id: revision.id }) }); setSubmittedId(revision.id); setNotice(`Revision ${revision.revision_number} submitted.`); await revisionState.reload(); onChanged?.(); }
     catch (err) { setError(err.message); }
     finally { setBusy(''); }
   };
   if (snapshotState.loading || proposalState.loading || revisionState.loading) return <Panel><p>Loading snapshot and revisions…</p></Panel>;
   const loadError = snapshotState.error || proposalState.error || revisionState.error;
   return <div className="workflow-stack">
+    {notice && <SuccessNotice key={notice}>{notice}</SuccessNotice>}
     <Panel><div className="section-head"><div><h2>Canonical snapshot</h2><p>This is the current source projection. Creating a canonical revision requires it to match source state exactly.</p></div><ActionButton kind="ghost" onClick={createCanonicalRevision} disabled={busy === 'snapshot' || !snapshotState.data}>{busy === 'snapshot' ? 'Saving…' : 'Save canonical revision'}</ActionButton></div><SnapshotDetails snapshot={snapshotState.data} /></Panel>
-    <Panel><div className="section-head"><div><h2>Generate artifacts</h2><p>Generation requires an approved proposal and creates an immutable revision with PDF and LaTeX artifacts.</p></div><div className="form-actions"><select value={proposalId} onChange={event => setProposalId(event.target.value)}><option value="">Select approved proposal</option>{approved.map(proposal => <option key={proposal.id} value={proposal.id}>Proposal {proposal.id}</option>)}</select><ActionButton onClick={generate} disabled={busy === 'generate' || !approved.length}>{busy === 'generate' ? 'Generating…' : 'Generate PDF + LaTeX'}</ActionButton></div></div>{!approved.length && <p>No approved proposals available.</p>}</Panel>
-    <Panel><div className="section-head"><div><h2>Generated revisions</h2><p>Submit only the exact generated revision you intend to use.</p></div></div><WorkflowError error={error || loadError} />{!revisions.length ? <p>No revisions yet.</p> : <div className="application-list">{revisions.map(revision => <div className="list-card" key={revision.id}><div className="section-head"><div><b>Revision {revision.revision_number}</b><small>{revision.generated_at ? new Date(revision.generated_at).toLocaleString() : 'Not generated'}</small></div><Status value={revision.status} /></div><p>{revision.page_count ? `${revision.page_count} page${revision.page_count === 1 ? '' : 's'}` : 'Page count unavailable'}</p>{revision.pdf_path && <a href={`${API_BASE}/generated/applications/${applicationId}/revision-${String(revision.revision_number).padStart(3, '0')}/resume.pdf`} target="_blank" rel="noreferrer">Open PDF</a>}<div className="form-actions"><ActionButton disabled={busy === `submit-${revision.id}` || !revision.generated_at || !revision.pdf_path || !revision.latex_path || revision.status === 'failed'} onClick={() => submit(revision)}>{busy === `submit-${revision.id}` ? 'Submitting…' : 'Submit this revision'}</ActionButton></div></div>)}</div>}</Panel>
+    <Panel><div className="section-head"><div><h2>Generate artifacts</h2><p>Generation requires an approved proposal and creates an immutable revision with PDF and LaTeX artifacts.</p></div><div className="form-actions"><select aria-label="Approved proposal" value={proposalId} onChange={event => setProposalId(event.target.value)}><option value="">Select approved proposal</option>{approved.map(proposal => <option key={proposal.id} value={proposal.id}>Proposal {proposal.id}</option>)}</select><ActionButton onClick={generate} disabled={busy === 'generate' || !approved.length}>{busy === 'generate' ? 'Generating…' : 'Generate PDF + LaTeX'}</ActionButton></div></div>{!approved.length && <p>No approved proposals available.</p>}</Panel>
+    <Panel><div className="section-head"><div><h2>Generated revisions</h2><p>Submit only the exact generated revision you intend to use.</p></div></div><WorkflowError error={error || loadError} />{!revisions.length ? <p>No revisions yet.</p> : <div className="application-list">{revisions.map(revision => <div className="list-card" key={revision.id}><div className="section-head"><div><b>Revision {revision.revision_number}</b><small>{revision.generated_at ? new Date(revision.generated_at).toLocaleString() : 'Not generated'}</small></div><Status value={revision.status} /></div><p>{revision.page_count ? `${revision.page_count} page${revision.page_count === 1 ? '' : 's'}` : 'Page count unavailable'}</p>{revision.pdf_path && <a href={`${API_BASE}${generatedArtifacts[revision.id]?.pdf_url || `/${revision.pdf_path}`}`} target="_blank" rel="noreferrer">Open PDF</a>}{revision.latex_path && <> · <a href={`${API_BASE}${generatedArtifacts[revision.id]?.latex_url || `/${revision.latex_path}`}`} target="_blank" rel="noreferrer">Open LaTeX</a></>}<div className="form-actions"><ActionButton disabled={Boolean(busy) || submittedId === revision.id || !revision.generated_at || !revision.pdf_path || !revision.latex_path || revision.status === 'failed'} onClick={() => submit(revision)}>{busy === `submit-${revision.id}` ? 'Submitting…' : submittedId === revision.id ? 'Submitted' : 'Submit this revision'}</ActionButton></div></div>)}</div>}</Panel>
   </div>;
 }
 
@@ -289,7 +280,7 @@ export function RevisionHistoryCompare({ applicationId }) {
   const choices = useMemo(() => rows.filter(row => row.id !== Number(fromId)), [rows, fromId]);
   const compare = async event => {
     event.preventDefault(); setCompareError('');
-    if (!fromId || !toId) { setCompareError('Choose both a before and after revision.'); return; }
+    if (!fromId || !toId || fromId === toId) { setCompareError('Choose two different revisions to compare.'); return; }
     setBusy(true);
     try { setComparison(await apiRequest(`/applications/${applicationId}/revisions/compare?from_revision_id=${encodeURIComponent(fromId)}&to_revision_id=${encodeURIComponent(toId)}`)); }
     catch (err) { setCompareError(err.message); }
@@ -297,7 +288,7 @@ export function RevisionHistoryCompare({ applicationId }) {
   };
   if (loading) return <Panel><p>Loading revision history…</p></Panel>;
   return <div className="workflow-stack"><Panel><div className="section-head"><div><h2>Revision history</h2><p>Revisions are immutable. Select two revisions to inspect semantic changes.</p></div></div><WorkflowError error={error} />{!rows.length ? <p>No revisions have been created.</p> : <div className="application-list">{rows.map(revision => <div className="list-card" key={revision.id}><div className="section-head"><b>Revision {revision.revision_number}</b><Status value={revision.status} /></div><small>ID {revision.id}{revision.page_count ? ` · ${revision.page_count} pages` : ''}</small></div>)}</div>}</Panel>
-    {rows.length > 1 && <Panel><form className="form-actions" onSubmit={compare}><label>Before<select value={fromId} onChange={event => setFromId(event.target.value)}><option value="">Select revision</option>{rows.map(row => <option key={row.id} value={row.id}>Revision {row.revision_number}</option>)}</select></label><label>After<select value={toId} onChange={event => setToId(event.target.value)}><option value="">Select revision</option>{choices.map(row => <option key={row.id} value={row.id}>Revision {row.revision_number}</option>)}</select></label><ActionButton disabled={busy}>{busy ? 'Comparing…' : 'Compare revisions'}</ActionButton></form><WorkflowError error={compareError} />{comparison && <div className="comparison-result"><p>{comparison.changed ? 'Changes found.' : 'No semantic changes found.'} Added: {comparison.summary.added}. Removed: {comparison.summary.removed}. Changed: {comparison.summary.changed}.</p><ul>{(comparison.changes || []).map((change, index) => <li key={`${change.path}-${index}`}><b>{change.kind}</b> · {change.entity} · {change.path}</li>)}</ul></div>}</Panel>}
+    {rows.length > 1 && <Panel><form className="form-actions" onSubmit={compare}><label>Before<select value={fromId} onChange={event => { setFromId(event.target.value); if (event.target.value === toId) setToId(''); setComparison(null); setCompareError(''); }}><option value="">Select revision</option>{rows.map(row => <option key={row.id} value={row.id}>Revision {row.revision_number}</option>)}</select></label><label>After<select value={toId} onChange={event => { setToId(event.target.value); setComparison(null); setCompareError(''); }}><option value="">Select revision</option>{choices.map(row => <option key={row.id} value={row.id}>Revision {row.revision_number}</option>)}</select></label><ActionButton type="submit" disabled={busy}>{busy ? 'Comparing…' : 'Compare revisions'}</ActionButton></form><WorkflowError error={compareError} />{comparison && <div className="comparison-result" role="status"><p>{comparison.changed ? 'Changes found.' : 'No semantic changes found.'} Added: {comparison.summary.added}. Removed: {comparison.summary.removed}. Changed: {comparison.summary.changed}.</p><ul>{(comparison.changes || []).map((change, index) => <li key={`${change.path}-${index}`}><b>{change.kind}</b> · {change.entity} · {change.path}</li>)}</ul></div>}</Panel>}
   </div>;
 }
 

@@ -184,3 +184,19 @@ def test_path_and_revision_scoped_comparison_aliases():
     second = _revision(application["id"], 2, {"contact": {}, "sections": [], "content_items": [], "bullets": [], "entries": []})
     assert client.get(f"/applications/{application['id']}/revisions/{first.id}/compare/{second.id}").status_code == 200
     assert client.get(f"/revisions/{first.id}/compare/{second.id}").status_code == 200
+
+
+def test_canonical_snapshot_response_can_be_saved_without_transformation():
+    """The browser must be able to round-trip the public snapshot response."""
+    resume = client.post('/base-resumes', json={'name': 'Round trip'}).json()
+    application = client.post('/applications', json={
+        'company': 'Example', 'position': 'Engineer',
+        'job_description': 'Build Python services', 'base_resume_id': resume['id'],
+    }).json()
+    snapshot = client.get(f"/applications/{application['id']}/snapshot")
+    assert snapshot.status_code == 200
+    revision = client.post(f"/applications/{application['id']}/revisions", json={
+        'resume_json': snapshot.json(),
+    })
+    assert revision.status_code == 200, revision.text
+    assert revision.json()['resume_json'] == snapshot.json()
