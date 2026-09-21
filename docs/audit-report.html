@@ -131,12 +131,12 @@
           <h2>Executive summary</h2>
           <p class="lede">The application has a healthy tested backend foundation and a successful frontend production build, but several functional and operational risks become significant under concurrent use, stale data, or a fresh-clone setup.</p>
           <div class="summary-grid" aria-label="Finding counts">
-            <div class="stat"><b>0</b><span>open critical / high-priority findings</span></div>
-            <div class="stat"><b>8</b><span>correctness / scalability findings</span></div>
+            <div class="stat"><b>2</b><span>open high-priority findings</span></div>
+            <div class="stat"><b>10</b><span>correctness / scalability findings</span></div>
             <div class="stat"><b>5</b><span>structural / operational findings</span></div>
             <div class="stat"><b>105</b><span>backend tests passing after remediation</span></div>
           </div>
-          <div class="callout"><strong>High-priority remediation complete:</strong> compiler work is bounded, fresh clones and standalone development start reliably, and the application interface now prevents duplicate analysis submissions and exposes recoverable list-load failures.</div>
+          <div class="callout"><strong>Follow-up audit:</strong> the original high-priority fixes improved request isolation, compiler cleanup, and baseline freshness checks. Two concurrency/freshness gaps remain: idempotency is not atomic, and a job-description edit can race with PDF generation.</div>
           <h3>What is working</h3>
           <p>The backend test suite completed successfully, the frontend production build completed successfully, proposal validation preserves source ownership/evidence checks, and generated revisions are modeled as immutable snapshots. These positives do not remove the concurrency, stale-data, startup, and frontend error-state concerns below.</p>
         </section>
@@ -167,6 +167,15 @@
             <button class="filter" type="button" data-filter="low">Low</button>
           </div>
 
+          <details class="finding" data-severity="high" open>
+            <summary><span class="status high">HIGH</span><span class="finding-title">Idempotency keys do not prevent concurrent duplicate analysis or proposal work</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> concurrent requests with the same idempotency key can both observe no completed run, invoke the provider, and persist duplicate output. A retry while a run is still pending does the same. The current regression test covers only sequential replay.</p><p><strong>Repair:</strong> enforce a database uniqueness contract for the operation/key scope, atomically reserve a run before calling the provider, and return/replay a durable running or completed result. Apply the same design to proposal generation.</p><div class="refs"><span class="path">backend/app/main.py:2309</span><span class="path">backend/app/main.py:2317</span><span class="path">backend/app/main.py:2406</span><span class="path">backend/tests/test_api.py:40</span></div></div>
+          </details>
+          <details class="finding" data-severity="high">
+            <summary><span class="status high">HIGH</span><span class="finding-title">A job-description edit can publish and leave submit-eligible stale generated work</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> generation checks proposal freshness before releasing its session for slow LaTeX compilation. If the job description changes during compilation, invalidation marks the proposal stale but the in-flight request still publishes a draft revision. Revisions carry no job-description identity and submission validates only the artifact, so an output for the old description can be submitted.</p><p><strong>Repair:</strong> capture the description identity when reserving a revision, recheck it under the publication lock, mark the run failed and remove staging output on mismatch, and reject submission of revisions whose identity is no longer current.</p><div class="refs"><span class="path">backend/app/main.py:1895</span><span class="path">backend/app/main.py:1913</span><span class="path">backend/app/main.py:3512</span><span class="path">backend/app/main.py:3535</span><span class="path">backend/app/main.py:3557</span></div></div>
+          </details>
+
           <details class="finding" data-severity="resolved" open>
             <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Request-wide database lock no longer serializes provider and rendering work</span><span></span></summary>
             <div class="finding-body"><p><strong>Remediation:</strong> database dependencies now provide per-request sessions without acquiring <code>OPERATION_BARRIER</code>. Analysis, proposal generation, and rendering commit their run state before slow provider/compiler work; rendering publishes only a validated staged artifact while holding the short backup/publication lock.</p><p><strong>Verification:</strong> the backend suite passes with a concurrency regression test that pauses analysis at the provider and confirms an unrelated application-list request completes before it is released.</p><div class="refs"><span class="path">backend/app/main.py:1133</span><span class="path">backend/app/main.py:2334</span><span class="path">backend/app/main.py:3521</span><span class="path">backend/tests/test_request_isolation.py:14</span></div></div>
@@ -191,15 +200,16 @@
             <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Analysis submission is guarded against duplicate work</span><span></span></summary>
             <div class="finding-body"><p><strong>Remediation:</strong> both Analyze actions use one busy guard and disable together. Each attempt uses a stable idempotency key in the standard header and request body; the API replays the completed current result for that key.</p><p><strong>Verification:</strong> API coverage confirms header-key replay returns the original analysis rather than creating another one.</p><div class="refs"><span class="path">src/main.jsx</span><span class="path">backend/app/main.py</span><span class="path">backend/tests/test_api.py</span></div></div>
           </details>
-          <details class="finding" data-severity="resolved">
-            <summary><span class="status resolved">RESOLVED</span><span class="finding-title">Application-list failures have a clear recoverable state</span><span></span></summary>
-            <div class="finding-body"><p><strong>Remediation:</strong> application data, loading status, and load errors are now tracked separately. Home and Applications render an explicit unavailable state with a Retry action instead of an empty workspace when the list request fails.</p><div class="refs"><span class="path">src/main.jsx</span></div></div>
+          <details class="finding" data-severity="medium">
+            <summary><span class="status medium">MEDIUM</span><span class="finding-title">Application-list failure state is incomplete on the Applications page</span><span></span></summary>
+            <div class="finding-body"><p><strong>Impact:</strong> Home renders the new unavailable/retry state, but Applications receives neither the shared loading/error state nor a retry path. A failed list request therefore appears as “No matching applications,” which is indistinguishable from an empty filtered result.</p><p><strong>Repair:</strong> pass the shared error/loading/reload props into Applications and render <code>ApplicationLoadState</code> before filters or rows.</p><div class="refs"><span class="path">src/main.jsx:9</span><span class="path">src/main.jsx:11</span><span class="path">src/main.jsx:18</span></div></div>
           </details>
         </section>
 
         <section class="card" id="correctness">
           <h2>Correctness and scalability</h2>
-          <p class="lede">These issues are important after the critical/high risks are contained, especially as source and application history grows.</p>
+          <p class="lede">These issues remain important alongside the high-priority concurrency and freshness repairs, especially as source and application history grows.</p>
+          <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Idempotency keys can be reused across a changed job description</span><span></span></summary><div class="finding-body"><p>After a description edit, analysis ignores a prior result whose fingerprint no longer matches, but inserts another run with the same key. Later lookups still select the old row first, so the new result is not replayed. Proposal generation returns a prior successful proposal for the key without checking its job-description identity, which can replay a stale proposal after fresh analysis.</p><div class="refs"><span class="path">backend/app/main.py:2309</span><span class="path">backend/app/main.py:2317</span><span class="path">backend/app/main.py:2406</span></div></div></details>
           <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">PATCH models are full-input models and may reset omitted fields</span><span></span></summary><div class="finding-body"><p>Resume and bullet PATCH routes accept models that behave like complete payloads. A caller that omits a field can unintentionally write its default, losing existing data. Use optional patch fields and apply only explicitly supplied values.</p><div class="refs"><span class="path">backend/app/main.py:1530</span><span class="path">backend/app/main.py:1771</span></div></div></details>
           <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Nullable ItemPatch fields can write NULL into required columns</span><span></span></summary><div class="finding-body"><p>Because nullable fields are accepted and then persisted, invalid updates can reach database constraints and surface as unhandled 500s. Validate required-field invariants at the API boundary and return a client-safe 422.</p><div class="refs"><span class="path">backend/app/main.py:1064</span><span class="path">backend/app/main.py:1416</span></div></div></details>
           <details class="finding" data-severity="medium"><summary><span class="status medium">MEDIUM</span><span class="finding-title">Duplicate resume entries can leak a database uniqueness error</span><span></span></summary><div class="finding-body"><p>The unique resume-entry constraint is correct, but the duplicate path is not translated into a stable conflict response. Catch the integrity error, roll back, and return a clear 409/422 that the UI can explain.</p><div class="refs"><span class="path">backend/app/main.py:1790</span></div></div></details>
@@ -221,12 +231,13 @@
 
         <section class="card" id="repair">
           <h2>Remaining repair sequence</h2>
-          <p class="lede">All critical and high-priority findings above are resolved. This order addresses the remaining correctness and maintainability work.</p>
+          <p class="lede">Address the remaining high-priority concurrency and freshness gaps before the broader correctness and maintainability work.</p>
           <ol class="repair">
-            <li><b>Harden PATCH and conflict semantics.</b> Use true partial-update schemas, validate required fields, and translate uniqueness/integrity failures into stable client errors.</li>
-            <li><b>Complete frontend list scalability.</b> Implement server-side pagination/search while preserving total and result state.</li>
+            <li><b>Make idempotency atomic.</b> Reserve runs under a unique operation/key contract, define behavior for in-progress retries and key reuse, and test concurrent analysis/proposal calls.</li>
+            <li><b>Close the generation freshness race.</b> Bind revisions to the job-description identity, recheck immediately before publication, and block stale revisions from submission.</li>
+            <li><b>Harden PATCH and list failure semantics.</b> Use true partial-update schemas, translate integrity failures into stable client errors, and show Applications the same recoverable error state as Home.</li>
             <li><b>Reduce query and migration coupling.</b> Batch evidence/source reads, adopt versioned migrations, split the backend module by domain, and pin dependencies.</li>
-            <li><b>Add regression coverage.</b> Cover compiler timeout cleanup, fresh-clone startup, PATCH omission semantics, pagination/error states, and an end-to-end happy path.</li>
+            <li><b>Add regression coverage.</b> Cover concurrent idempotency, the generation/edit race, PATCH omission semantics, pagination/error states, and an end-to-end happy path.</li>
           </ol>
         </section>
 
