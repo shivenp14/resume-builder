@@ -4,12 +4,14 @@ The API deliberately keeps AI output as proposals: source records and revisions
 are never silently changed by analysis or optimization.
 """
 from datetime import datetime, timezone
-import copy, hashlib, json, os, re, shutil, tempfile
+import base64, copy, hashlib, json, os, re, shutil, tempfile
+from io import BytesIO
 from pathlib import Path
 import threading
 from typing import Any, Literal
 import uuid
-from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
@@ -38,6 +40,7 @@ engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread"
 # FastAPI may enter and clean up a synchronous yield dependency on different
 # worker threads. A Lock is intentionally not thread-owner-bound, unlike RLock.
 OPERATION_BARRIER = threading.Lock()
+PDFIUM_RENDER_BARRIER = threading.Lock()
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_foreign_keys(connection, _record):
@@ -1808,6 +1811,74 @@ def resume(id:int,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
     if not o: raise HTTPException(404,"base resume not found")
     return o
+@app.get("/base-resumes/{id}/preview.pdf", response_class=Response)
+def base_resume_preview(id:int,download:bool=False,s:Session=Depends(db)):
+    """Render the current base resume without allocating an application revision."""
+    base=s.get(BaseResume,id)
+    if not base: raise HTTPException(404,"base resume not found")
+    try:
+        snapshot=build_snapshot(base,s)
+    except ValidationError as exc:
+        raise HTTPException(422,str(exc))
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"base-resume-{id}-preview-") as temp_dir:
+            _,pdf=ResumeRenderer().compile(snapshot,temp_dir)
+            count_pdf_pages(pdf)
+            content=pdf.read_bytes()
+    except (RuntimeError,FileNotFoundError) as exc:
+        raise HTTPException(503,f"Resume preview could not be generated: {exc}")
+    disposition="attachment" if download else "inline"
+    return Response(content=content,media_type="application/pdf",headers={
+        "Content-Disposition": f'{disposition}; filename="base-resume-{id}.pdf"',
+        "Cache-Control": "no-store, max-age=0",
+    })
+
+@app.get("/base-resumes/{id}/preview-pages")
+def base_resume_preview_pages(id:int,s:Session=Depends(db)):
+    """Render current resume pages as images for an app-integrated preview."""
+    base=s.get(BaseResume,id)
+    if not base: raise HTTPException(404,"base resume not found")
+    try:
+        snapshot=build_snapshot(base,s)
+    except ValidationError as exc:
+        raise HTTPException(422,str(exc))
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"base-resume-{id}-preview-") as temp_dir:
+            _,pdf=ResumeRenderer().compile(snapshot,temp_dir)
+            count_pdf_pages(pdf)
+            content=pdf.read_bytes()
+        import pypdfium2 as pdfium
+        pages=[]
+        # PDFium is not thread-safe; serialize its calls across API worker threads.
+        with PDFIUM_RENDER_BARRIER:
+            with pdfium.PdfDocument(content) as document:
+                for index in range(len(document)):
+                    page=document[index]
+                    bitmap=None
+                    try:
+                        # The page can display at 800 CSS pixels wide. Render
+                        # near 2x that size so small resume text stays crisp
+                        # on high-density displays.
+                        bitmap=page.render(scale=2.7)
+                        image=bitmap.to_pil()
+                        output=BytesIO()
+                        image.save(output,format="PNG",optimize=True)
+                        pages.append({
+                            "page": index + 1,
+                            "width": image.width,
+                            "height": image.height,
+                            "data_url": "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii"),
+                        })
+                    finally:
+                        if bitmap is not None:
+                            bitmap.close()
+                        page.close()
+    except (RuntimeError,FileNotFoundError,OSError) as exc:
+        raise HTTPException(503,f"Resume preview could not be generated: {exc}")
+    return JSONResponse({"page_count":len(pages),"pages":pages},headers={
+        "Cache-Control":"no-store, max-age=0",
+    })
+
 @app.patch("/base-resumes/{id}",response_model=BaseResumeOut)
 def edit_resume(id:int,x:ResumeIn,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
@@ -3269,9 +3340,10 @@ def proposal_decision(id:int, decision:dict, s:Session=Depends(db)):
 def proposals(id:int,s:Session=Depends(db)):
     if not s.get(Application,id): raise HTTPException(404,"application not found")
     return s.query(Proposal).filter_by(application_id=id).order_by(Proposal.created_at.desc()).all()
-def build_snapshot(a:Application,s:Session,proposal_payload:dict|None=None,proposal_id:int|None=None):
-    base=s.get(BaseResume,a.base_resume_id)
-    base_entries=s.query(BaseEntry).filter_by(base_resume_id=a.base_resume_id).order_by(BaseEntry.entry_order).all()
+def build_snapshot(a:Application|BaseResume,s:Session,proposal_payload:dict|None=None,proposal_id:int|None=None):
+    base_resume_id=a.base_resume_id if isinstance(a,Application) else a.id
+    base=s.get(BaseResume,base_resume_id)
+    base_entries=s.query(BaseEntry).filter_by(base_resume_id=base_resume_id).order_by(BaseEntry.entry_order).all()
     selected=(proposal_payload or {}).get("selected_entries") or [
         {"content_item_id":entry.content_item_id,"bullet_ids":list(entry.selected_bullet_ids)} for entry in base_entries]
     item_ids=[entry["content_item_id"] for entry in selected]

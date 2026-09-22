@@ -136,6 +136,61 @@ test('skills, aliases, profiles and base resume entry composition persist', asyn
   await expect(page.getByText(`Selected bullet IDs: ${bullet.id}`, { exact: true })).toBeVisible();
 });
 
+test('base resume detail previews a PDF before entries and refreshes after an entry save', async ({ page, request }) => {
+  const { item, bullet, resume } = await seed(request);
+  const replacementBullet = await post(request, `/content-items/${item.id}/bullets`, {
+    text: 'Shipped the updated resume preview', supporting_facts: ['updated preview'],
+  });
+  const previewRequests = [];
+  const previewPixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p4sAAAAASUVORK5CYII=';
+  await page.route(`**/base-resumes/${resume.id}/preview-pages*`, async route => {
+    previewRequests.push(route.request().url());
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        page_count: 2,
+        pages: [1, 2].map(page => ({ page, width: 612, height: 792, data_url: previewPixel })),
+      }),
+    });
+  });
+
+  await page.goto(`/resumes/${resume.id}`);
+  const preview = page.locator('.base-resume-preview');
+  await expect(preview).toBeVisible();
+  await expect(page.locator('.resume-preview-page')).toHaveCount(2);
+  await expect(page.getByAltText('Resume page 1 of 2')).toBeVisible();
+  await expect(page.getByText('2 pages', { exact: true })).toBeVisible();
+  await expect(page.getByTitle('Base resume PDF preview')).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Open PDF' })).toHaveAttribute('href', new RegExp(`/base-resumes/${resume.id}/preview\\.pdf$`));
+  await expect(page.getByRole('link', { name: 'Download PDF' })).toHaveAttribute('href', new RegExp(`/base-resumes/${resume.id}/preview\\.pdf\\?download=true$`));
+  await expect.poll(() => previewRequests.length).toBe(1);
+  const previewLeadsEntries = await page.evaluate(() => {
+    const previewCard = document.querySelector('.base-resume-preview');
+    const entriesHeading = [...document.querySelectorAll('h2')].find(heading => heading.textContent === 'Entries');
+    return Boolean(previewCard && entriesHeading && (previewCard.compareDocumentPosition(entriesHeading) & Node.DOCUMENT_POSITION_FOLLOWING));
+  });
+  expect(previewLeadsEntries).toBe(true);
+  await expect(page.getByText(`Selected bullet IDs: ${bullet.id}`, { exact: true })).toBeVisible();
+
+  await page.locator('.list-card').filter({ hasText: item.title }).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByLabel('Selected bullets').selectOption(String(replacementBullet.id));
+  await page.getByRole('button', { name: 'Save entry' }).click();
+
+  await expect(page.getByText(`Selected bullet IDs: ${replacementBullet.id}`, { exact: true })).toBeVisible();
+  await expect.poll(() => previewRequests.length).toBe(2);
+  expect(new URL(previewRequests[1]).searchParams.get('refresh')).toBe('1');
+  const savedEntries = await (await request.get(`${api}/base-resumes/${resume.id}/entries`)).json();
+  expect(savedEntries[0].selected_bullet_ids).toEqual([replacementBullet.id]);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.resume-preview-page')).toHaveCount(2);
+  await expect(page.getByRole('link', { name: 'Open PDF' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Download PDF' })).toBeVisible();
+  const previewBounds = await page.locator('.resume-preview-page').first().boundingBox();
+  expect(previewBounds.width).toBeLessThanOrEqual(390);
+});
+
 test('confirmed requirement materializes through its submit button', async ({ page, request }) => {
   const { application } = await seed(request);
   await post(request, `/applications/${application.id}/analyze`);

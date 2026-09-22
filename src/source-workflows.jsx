@@ -32,6 +32,42 @@ function useLoad(loader, deps) {
   return { ...state, reload };
 }
 
+function BaseResumePreview({ resumeId, refreshKey }) {
+  const [preview, setPreview] = useState({ pages: [], pageCount: 0, loading: true, error: '' });
+  useEffect(() => {
+    const controller = new AbortController();
+    setPreview({ pages: [], pageCount: 0, loading: true, error: '' });
+    fetch(`${API_BASE}/base-resumes/${resumeId}/preview-pages?refresh=${refreshKey}`, {
+      cache: 'no-store', signal: controller.signal,
+    }).then(async response => {
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || `Preview could not be generated (${response.status}).`);
+      }
+      return response.json();
+    }).then(data => {
+      if (!controller.signal.aborted) setPreview({ pages: data.pages || [], pageCount: data.page_count || 0, loading: false, error: '' });
+    }).catch(error => {
+      if (error.name !== 'AbortError') setPreview({ pages: [], pageCount: 0, loading: false, error: error.message });
+    });
+    return () => controller.abort();
+  }, [resumeId, refreshKey]);
+
+  const pdfUrl = `${API_BASE}/base-resumes/${resumeId}/preview.pdf`;
+  return <Panel className="base-resume-preview">
+    <div className="section-head"><div><h2>Resume preview</h2><p>Current layout and selected content</p></div><div className="preview-actions"><a className="button ghost" href={pdfUrl} target="_blank" rel="noreferrer">Open PDF</a><a className="button ghost" href={`${pdfUrl}?download=true`}>Download PDF</a></div></div>
+    {preview.loading ? <div className="preview-status" role="status">Preparing PDF preview…</div>
+      : preview.error ? <div className="preview-status preview-error" role="alert"><b>Preview unavailable</b><p>{preview.error}</p><small>Check the resume details below and try refreshing the page.</small></div>
+        : <div className="resume-preview-stage" aria-label={`Resume preview, ${preview.pageCount} ${preview.pageCount === 1 ? 'page' : 'pages'}`}>
+          <p className="resume-page-count">{preview.pageCount} {preview.pageCount === 1 ? 'page' : 'pages'}</p>
+          <div className="resume-preview-pages">{preview.pages.map(page => <figure className="resume-preview-page" key={page.page}>
+            <img src={page.data_url} width={page.width} height={page.height} alt={`Resume page ${page.page} of ${preview.pageCount}`} />
+            <figcaption>Page {page.page} of {preview.pageCount}</figcaption>
+          </figure>)}</div>
+        </div>}
+  </Panel>;
+}
+
 const itemDefaults = { type: 'experience', title: '', organization: '', location: '', start_date: '', end_date: '', summary: '', tags: '' };
 function ItemFields({ value, setValue, skills = [], includeSkills = true }) {
   const update = (key, next) => setValue(v => ({ ...v, [key]: next }));
@@ -184,7 +220,49 @@ function EntryEditor({ resumeId, entry, items, onSaved, onCancel }) { const [ite
 export function BaseResumesPage({ go, onChanged }) { const state = useLoad(() => sourceRequest('/base-resumes'), []); const [profiles, setProfiles] = useState([]); const [creating, setCreating] = useState(false); useEffect(() => { sourceRequest('/personal-information').then(setProfiles).catch(() => {}); }, []); if (state.loading) return <Loading label="Loading base resumes…" />; if (state.error) return <Empty title="Base resumes unavailable" copy={state.error} />; return <><Header title="Base resumes" copy="Reusable compositions of profiles, source items, and exact bullet selections." action={<Button onClick={() => setCreating(!creating)}>{creating ? 'Close' : 'Add base resume'}</Button>} />{creating && <Panel><ResumeForm create profiles={profiles} onCancel={() => setCreating(false)} onSaved={() => { setCreating(false); state.reload(); onChanged?.(); }} /></Panel>}{!(state.data || []).length ? <Empty title="No base resumes" copy="Create one before starting an application." /> : <div className="resume-grid">{state.data.map(resume => <button className="source-card" key={resume.id} onClick={() => go?.(`/resumes/${resume.id}`)}><span className="source-type">{resume.template_id}</span><h2>{resume.name}</h2><p>{(resume.section_order || []).join(' · ') || 'No section order configured'}</p></button>)}</div>}</>; }
 export const BaseResumes = BaseResumesPage;
 
-export function BaseResumeDetail({ id, go, onChanged }) { const state = useLoad(() => sourceRequest(`/base-resumes/${id}`), [id]); const entriesState = useLoad(() => sourceRequest(`/base-resumes/${id}/entries`), [id]); const itemsState = useLoad(() => sourceRequest('/content-items?include_archived=true'), []); const profilesState = useLoad(() => sourceRequest('/personal-information'), []); const [editing, setEditing] = useState(false); const [adding, setAdding] = useState(false); const [editEntry, setEditEntry] = useState(null); const [error, setError] = useState(''); const [busy, setBusy] = useState(false); if (state.loading || entriesState.loading || itemsState.loading || profilesState.loading) return <Loading label="Loading base resume…" />; if (state.error) return <Empty title="Base resume unavailable" copy={state.error} />; const resume = state.data; const reload = () => { state.reload(); entriesState.reload(); onChanged?.(); }; const removeEntry = async entry => { if (!window.confirm('Remove this entry from the base resume?')) return; setBusy(true); setError(''); try { await sourceRequest(`/base-entries/${entry.id}`, { method: 'DELETE' }); reload(); } catch (err) { setError(err.message); } finally { setBusy(false); } }; return <><Header title={resume.name} copy={`${resume.template_id} template`} action={<Button kind="ghost" onClick={() => setEditing(!editing)}>{editing ? 'Close editor' : 'Edit resume'}</Button>} />{error && <ErrorText error={error} />}{editing && <Panel><ResumeForm resume={resume} profiles={profilesState.data || []} onCancel={() => setEditing(false)} onSaved={() => { setEditing(false); reload(); }} /></Panel>}<Panel><div className="section-head"><div><h2>Entries</h2><p>Each entry chooses one source item and exact bullet IDs.</p></div><Button onClick={() => { setAdding(!adding); setEditEntry(null); }}>{adding ? 'Close' : 'Add entry'}</Button></div>{adding && <EntryEditor resumeId={id} items={itemsState.data || []} onCancel={() => setAdding(false)} onSaved={() => { setAdding(false); reload(); }} />}{!(entriesState.data || []).length ? <p>No entries yet.</p> : <div className="application-list">{entriesState.data.map(entry => { const item = (itemsState.data || []).find(x => x.id === entry.content_item_id); return <Panel className="list-card" key={entry.id}><div className="section-head"><div><b>{entry.entry_order}. {item?.title || `Source item ${entry.content_item_id}`}</b><small>Selected bullet IDs: {(entry.selected_bullet_ids || []).join(', ') || 'none'}</small></div><div className="form-actions"><Button kind="ghost" onClick={() => { setEditEntry(entry); setAdding(false); }}>Edit</Button><Button kind="ghost" disabled={busy} onClick={() => removeEntry(entry)}>Remove</Button></div></div>{editEntry?.id === entry.id && <EntryEditor resumeId={id} entry={entry} items={itemsState.data || []} onCancel={() => setEditEntry(null)} onSaved={() => { setEditEntry(null); reload(); }} />}</Panel>; })}</div>}</Panel></>; }
+export function BaseResumeDetail({ id, go, onChanged }) {
+  const state = useLoad(() => sourceRequest(`/base-resumes/${id}`), [id]);
+  const entriesState = useLoad(() => sourceRequest(`/base-resumes/${id}/entries`), [id]);
+  const itemsState = useLoad(() => sourceRequest('/content-items?include_archived=true'), []);
+  const profilesState = useLoad(() => sourceRequest('/personal-information'), []);
+  const [previewRefresh, setPreviewRefresh] = useState(0);
+  const [editing, setEditing] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [editEntry, setEditEntry] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (state.loading || entriesState.loading || itemsState.loading || profilesState.loading) return <Loading label="Loading base resume…" />;
+  if (state.error) return <Empty title="Base resume unavailable" copy={state.error} />;
+  const resume = state.data;
+  const reload = () => {
+    state.reload();
+    entriesState.reload();
+    setPreviewRefresh(key => key + 1);
+    onChanged?.();
+  };
+  const removeEntry = async entry => {
+    if (!window.confirm('Remove this entry from the base resume?')) return;
+    setBusy(true);
+    setError('');
+    try { await sourceRequest(`/base-entries/${entry.id}`, { method: 'DELETE' }); reload(); }
+    catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  return <>
+    <Header title={resume.name} copy={`${resume.template_id} template`} action={<Button kind="ghost" onClick={() => setEditing(!editing)}>{editing ? 'Close editor' : 'Edit resume'}</Button>} />
+    <BaseResumePreview resumeId={id} refreshKey={previewRefresh} />
+    {error && <ErrorText error={error} />}
+    {editing && <Panel><ResumeForm resume={resume} profiles={profilesState.data || []} onCancel={() => setEditing(false)} onSaved={() => { setEditing(false); reload(); }} /></Panel>}
+    <Panel>
+      <div className="section-head"><div><h2>Entries</h2><p>Each entry chooses one source item and exact bullet IDs.</p></div><Button onClick={() => { setAdding(!adding); setEditEntry(null); }}>{adding ? 'Close' : 'Add entry'}</Button></div>
+      {adding && <EntryEditor resumeId={id} items={itemsState.data || []} onCancel={() => setAdding(false)} onSaved={() => { setAdding(false); reload(); }} />}
+      {!(entriesState.data || []).length ? <p>No entries yet.</p> : <div className="application-list">{entriesState.data.map(entry => {
+        const item = (itemsState.data || []).find(x => x.id === entry.content_item_id);
+        return <Panel className="list-card" key={entry.id}><div className="section-head"><div><b>{entry.entry_order}. {item?.title || `Source item ${entry.content_item_id}`}</b><small>Selected bullet IDs: {(entry.selected_bullet_ids || []).join(', ') || 'none'}</small></div><div className="form-actions"><Button kind="ghost" onClick={() => { setEditEntry(entry); setAdding(false); }}>Edit</Button><Button kind="ghost" disabled={busy} onClick={() => removeEntry(entry)}>Remove</Button></div></div>{editEntry?.id === entry.id && <EntryEditor resumeId={id} entry={entry} items={itemsState.data || []} onCancel={() => setEditEntry(null)} onSaved={() => { setEditEntry(null); reload(); }} />}</Panel>;
+      })}</div>}
+    </Panel>
+  </>;
+}
 export const BaseResumeEdit = BaseResumeDetail;
 
 export function BackupsPage() { const state = useLoad(() => sourceRequest('/backups'), []); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [created, setCreated] = useState(null); const create = async () => { setBusy(true); setError(''); setCreated(null); try { const backup = await sourceRequest('/backups', { method: 'POST' }); setCreated(backup); await state.reload(); } catch (err) { setError(err.message); } finally { setBusy(false); } }; if (state.loading) return <Loading label="Loading backups…" />; return <><Header title="Data safety" copy="Create and inspect local database and artifact backups." action={<Button onClick={create} disabled={busy}>{busy ? 'Creating backup…' : 'Create backup'}</Button>} />{error && <ErrorText error={error} />}{created && <SuccessNotice>Backup created: {created.filename}</SuccessNotice>}{state.error ? <Empty title="Backups unavailable" copy={state.error} /> : !(state.data || []).length ? <Empty title="No backups" copy="Create a backup when you want a recoverable local archive." /> : <Panel className="backup-list">{state.data.map(backup => <div className="backup-row" key={backup.filename}><span className="backup-version">v{backup.backup_version}</span><div><b>{backup.filename}</b><small>{backup.created_at ? new Date(backup.created_at).toLocaleString() : ''}</small></div><span>{backup.size} bytes</span><span>{backup.artifact_count} artifacts</span><span>{backup.sha256?.slice(0, 10)}…</span></div>)}</Panel>}</>; }

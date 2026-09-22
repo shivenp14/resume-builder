@@ -39,3 +39,10 @@ dist/
 # Browser test artifacts
 playwright-report/
 test-results/
+
+# Repository agent-system files
+/.agent-state/
+/.agents/
+/.codex/
+/AGENTS.md
+/docs/agent/
