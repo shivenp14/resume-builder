@@ -11,7 +11,8 @@ from backend.app.main import (ROOT, Application, BaseEntry, BaseResume, Bullet,
     ConfirmationMaterialization, MissingConfirmation, PersonalInformation, Proposal, Revision,
     RequirementEvidenceLink, JobRequirement, ApplicationStatusHistory, SessionLocal, Skill, analyze_text,
     _append_bullet_version, _append_content_version, _BULLET_VERSION_FIELDS,
-    _CONTENT_VERSION_FIELDS, _contact_to_personal_values, _backfill_legacy_contacts)
+    _CONTENT_VERSION_FIELDS, _contact_to_personal_values, _backfill_legacy_contacts,
+    _checkpoint_skill_groups)
 
 CHECKPOINTS = ROOT / "checkpoints"
 PRIMARY = "baseline-2026-07-27"
@@ -66,7 +67,7 @@ def parse_contact(path: Path) -> dict[str,str]:
         "email":email_match.group(1) if email_match else "","phone":phone_match.group(0) if phone_match else ""}
     if linkedin_match:
         contact["linkedin"]=linkedin_match.group(0)
-        contact["linkedin_label"]=contact["linkedin"].removeprefix("https://").removeprefix("http://").rstrip("/")
+        contact["linkedin_label"]=contact["linkedin"].removeprefix("https://").removeprefix("http://")
     return contact
 
 def parse_resume(path: Path) -> list[dict]:
@@ -77,8 +78,12 @@ def parse_resume(path: Path) -> list[dict]:
         section_name = section_name.replace("technical skills", "skills").replace("relevant skills", "skills")
         end = sections[section_index + 1].start() if section_index + 1 < len(sections) else len(text)
         body = text[section.end():end]
+        skill_groups=_checkpoint_skill_groups(path) if section_name == "skills" else None
         markers = list(re.finditer(r"\\resume(Subheading|ProjectHeading)\b", body))
         if not markers:
+            if section_name == "skills":
+                records.append({"type":section_name,"title":clean(section.group(1)),"summary":"","bullets":[],"skill_groups":skill_groups or []})
+                continue
             summary = clean(body)
             if summary: records.append({"type": section_name, "title": clean(section.group(1)), "summary": summary, "bullets": []})
             continue
@@ -129,7 +134,8 @@ def seed() -> None:
             base = BaseResume(name=DISPLAY_NAMES.get(slug, slug.replace("-", " ").title()), template_id="latex-checkpoint",
                 section_order=[], layout_settings={"primary": is_primary, "owner":owner,
                 "contact":contact,"checkpoint": slug,
-                "pdf_path": pdf_file.relative_to(ROOT).as_posix()})
+                "pdf_path": pdf_file.relative_to(ROOT).as_posix(),
+                "skill_groups":_checkpoint_skill_groups(folder / "resume.tex")})
             session.add(base); session.flush()
             personal_values=_contact_to_personal_values(contact)
             personal_values["is_primary"]=is_primary
@@ -140,6 +146,7 @@ def seed() -> None:
                 item_type = record.get("type", "other")
                 if item_type not in section_order: section_order.append(item_type)
                 bullets = record.pop("bullets", [])
+                record.pop("skill_groups", None)
                 item = ContentItem(**record, tags=[f"checkpoint:{slug}"], is_archived=False)
                 session.add(item); session.flush()
                 _append_content_version(session, item, action="created", changed_fields=list(_CONTENT_VERSION_FIELDS))
@@ -178,6 +185,12 @@ def migrate_verified() -> None:
             # do not accept arbitrary paths from layout_settings.
             if not folder.is_dir() or not (folder / "resume.tex").is_file():
                 continue
+            if "skill_groups" not in settings:
+                groups=_checkpoint_skill_groups(folder / "resume.tex")
+                if groups:
+                    settings["skill_groups"]=groups
+                    base.layout_settings=settings
+                    updated+=1
             # Presence, rather than truthiness, is the migration marker.  An
             # intentionally empty parsed contact must not be reprocessed on
             # every invocation.

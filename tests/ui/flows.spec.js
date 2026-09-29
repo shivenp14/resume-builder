@@ -276,9 +276,11 @@ test('data safety creates and lists a local backup', async ({ page }) => {
   await expect(page.locator('.backup-row').first()).toBeVisible();
 });
 
-test('proposal review generates real artifacts and submits the exact revision', async ({ page, request }) => {
+test('proposal review generates real artifacts and submits the exact revision', async ({ page, request, context }) => {
   test.setTimeout(90_000);
   const { application } = await seed(request);
+  await request.patch(`${api}/applications/${application.id}`, { data: { job_url: 'https://jobs.example.test/real-submit-flow' } });
+  await context.route('https://jobs.example.test/**', route => route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Employer application</title>' }));
   await post(request, `/applications/${application.id}/analyze`);
   await page.goto(`/applications/${application.id}/proposal`);
   await page.getByRole('button', { name: 'Generate proposal', exact: true }).click();
@@ -288,21 +290,44 @@ test('proposal review generates real artifacts and submits the exact revision', 
   await page.getByRole('button', { name: 'Generate', exact: true }).click();
   await page.getByRole('combobox', { name: 'Approved proposal' }).selectOption({ index: 1 });
   await page.getByRole('button', { name: 'Generate PDF + LaTeX' }).click();
-  await expect(page.getByRole('link', { name: 'Open PDF' })).toBeVisible({ timeout: 60_000 });
-  for (const name of ['Open PDF', 'Open LaTeX']) {
+  await expect(page.getByRole('link', { name: 'View exact PDF' })).toBeVisible({ timeout: 60_000 });
+  for (const name of ['View exact PDF', 'View LaTeX source']) {
     const response = await request.get(await page.getByRole('link', { name }).getAttribute('href'));
     expect(response.ok()).toBeTruthy();
   }
-  await page.getByRole('button', { name: 'Submit this revision' }).click();
-  await expect(page.getByRole('status')).toContainText('Revision 1 submitted.');
-  await expect(page.getByRole('button', { name: 'Submitted', exact: true })).toBeDisabled();
-  const saved = await (await request.get(`${api}/applications/${application.id}`)).json();
   const revisions = await (await request.get(`${api}/applications/${application.id}/revisions`)).json();
+  const submittedRevision = revisions[0];
+  const downloadUrl = await page.getByRole('link', { name: 'Download PDF' }).first().getAttribute('href');
+  expect(downloadUrl).toContain(`/applications/${application.id}/revisions/${submittedRevision.id}/download.pdf`);
+  const downloadResponse = await request.get(downloadUrl);
+  expect(downloadResponse.ok()).toBeTruthy();
+  expect(downloadResponse.headers()['content-disposition']).toContain('attachment');
+  const [popup] = await Promise.all([
+    page.waitForEvent('popup'),
+    page.getByRole('link', { name: 'Open employer application (new tab)' }).click(),
+  ]);
+  await expect(popup).toHaveTitle('Employer application');
+  await popup.close();
+  const beforeConfirmation = await (await request.get(`${api}/applications/${application.id}`)).json();
+  expect(beforeConfirmation.status).toBe('draft');
+
+  const confirm = page.getByRole('button', { name: 'Confirm submission' });
+  await expect(confirm).toBeDisabled();
+  await page.getByLabel('Revision you uploaded').selectOption(String(submittedRevision.id));
+  await expect(confirm).toBeDisabled();
+  await page.getByLabel('I submitted the employer form and uploaded the selected resume revision.').check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect(page.locator('.submitted-note')).toContainText(`Submitted with revision ID ${submittedRevision.id}`);
+  await expect(page.getByRole('button', { name: 'Confirm submission' })).toHaveCount(0);
+  const saved = await (await request.get(`${api}/applications/${application.id}`)).json();
   expect(saved.status).toBe('applied');
-  expect(saved.submitted_revision_id).toBe(revisions[0].id);
+  expect(saved.submitted_revision_id).toBe(submittedRevision.id);
   await page.reload();
-  for (const name of ['Open PDF', 'Open LaTeX']) {
+  await expect(page.locator('.submitted-note')).toContainText(`Submitted with revision ID ${submittedRevision.id}`);
+  for (const name of ['View exact PDF', 'View LaTeX source']) {
     const response = await request.get(await page.getByRole('link', { name }).getAttribute('href'));
     expect(response.ok()).toBeTruthy();
   }
+  await expect(page.getByRole('button', { name: 'Confirm submission' })).toHaveCount(0);
 });

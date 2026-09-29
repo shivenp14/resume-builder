@@ -125,3 +125,39 @@ def test_base_resume_preview_reports_renderer_failure(monkeypatch):
 
     assert response.status_code == 503
     assert "Resume preview could not be generated" in response.json()["detail"]
+
+
+def test_base_resume_skill_order_is_saved_per_resume_and_drives_snapshot():
+    first_groups=[{"category":"Programming","skills":["Python","Java","SQL"]}]
+    second_groups=[{"category":"Programming","skills":["SQL","Python","Java"]}]
+    first=client.post("/base-resumes",json={"name":"Ordered skills","section_order":["skills"],
+        "layout_settings":{"skill_groups":first_groups}}).json()
+    second=client.post("/base-resumes",json={"name":"Independent order","section_order":["skills"],
+        "layout_settings":{"skill_groups":second_groups}}).json()
+
+    saved=client.patch(f"/base-resumes/{first['id']}",json={"name":first["name"],
+        "template_id":first["template_id"],"section_order":["skills"],
+        "layout_settings":{"skill_groups":[{"category":"Programming","skills":["Java","Python","SQL"]}]},
+        "personal_information_id":None})
+    assert saved.status_code == 200, saved.text
+
+    with main.SessionLocal() as session:
+        first_snapshot=main.build_snapshot(session.get(main.BaseResume,first["id"]),session)
+        second_snapshot=main.build_snapshot(session.get(main.BaseResume,second["id"]),session)
+    assert first_snapshot["sections"][0]["skill_groups"][0]["skills"] == ["Java","Python","SQL"]
+    assert second_snapshot["sections"][0]["skill_groups"][0]["skills"] == ["SQL","Python","Java"]
+    assert client.get(f"/base-resumes/{first['id']}").json()["layout_settings"]["skill_groups"][0]["skills"] == ["Java","Python","SQL"]
+
+
+def test_typed_contact_snapshot_preserves_url_trailing_slash():
+    profile = client.post("/personal-information", json={
+        "name": "Slash User", "linkedin": "https://linkedin.com/in/slash-user/",
+    }).json()
+    resume = client.post("/base-resumes", json={
+        "name": "Trailing slash", "personal_information_id": profile["id"],
+    }).json()
+
+    with main.SessionLocal() as session:
+        snapshot = main.build_snapshot(session.get(main.BaseResume, resume["id"]), session)
+
+    assert snapshot["contact"]["linkedin_label"] == "linkedin.com/in/slash-user/"

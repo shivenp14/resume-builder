@@ -1,19 +1,21 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { withCodexExecutable } from './codex-executable.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const backendDir = resolve(root, 'backend');
 const python = existsSync(resolve(backendDir, '.venv/bin/python'))
   ? resolve(backendDir, '.venv/bin/python')
   : 'python3';
+const childEnv = withCodexExecutable();
 
 const child = spawn(
   python,
   ['-m', 'uvicorn', 'app.main:app', '--reload', '--host', '127.0.0.1', '--port', '8000'],
   {
     cwd: backendDir,
-    env: process.env,
+    env: childEnv,
     stdio: 'inherit',
   },
 );

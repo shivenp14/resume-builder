@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import fcntl
 from pathlib import Path
 import re
 import shutil
@@ -30,6 +31,8 @@ BACKUP_FORMAT = "resume-builder-backup"
 BACKUP_FORMAT_VERSION = 1
 BACKUP_SCHEMA_VERSION = "1"
 BACKUP_PREFIX = "resume-backup-v"
+BACKUP_LOCK_FILENAME = ".resume-backup.lock"
+DATABASE_STARTUP_LOCK_FILENAME = ".database-startup.lock"
 MANIFEST_NAME = "manifest.json"
 DATABASE_MEMBER = "database/app.db"
 ARTIFACT_PREFIX = "artifacts/"
@@ -39,13 +42,94 @@ MAX_TOTAL_MEMBER_BYTES = 1024 * 1024 * 1024
 MAX_TOTAL_COMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_BACKUP_ARCHIVES = 10
+MAX_BACKUP_TOTAL_BYTES = 512 * 1024 * 1024
 
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$")
+_MANAGED_BACKUP_FILENAME = re.compile(
+    rf"^{re.escape(BACKUP_PREFIX)}(\d+)-\d{{8}}T\d{{6}}Z-[0-9a-f]{{10}}\.zip$"
+)
 _BACKUP_CREATION_LOCK = threading.Lock()
 
 
 class BackupError(RuntimeError):
     """An archive could not be safely created, inspected, or restored."""
+
+
+@contextmanager
+def _backup_process_lock(backup_root: Path):
+    """Serialize backup allocation/publication/retention across processes."""
+    try:
+        backup_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BackupError(f"could not prepare backup directory: {exc}") from exc
+    if backup_root.is_symlink() or not backup_root.is_dir():
+        raise BackupError("backup root must be a real directory")
+
+    lock_path = backup_root / BACKUP_LOCK_FILENAME
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise BackupError(f"could not open backup coordination lock: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BackupError("backup coordination lock must be a regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise BackupError(f"could not acquire backup coordination lock: {exc}") from exc
+        # Recheck after waiting: the storage directory must not have become a
+        # symlink while another process held the lock.
+        if backup_root.is_symlink() or not backup_root.is_dir():
+            raise BackupError("backup root must be a real directory")
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            # Closing the descriptor also releases the lock.
+            pass
+        os.close(descriptor)
+
+
+@contextmanager
+def database_startup_lock(workspace_root: str | Path):
+    """Serialize startup migrations with backups from every app process.
+
+    Manual backup callers acquire this same lock before the backup service's
+    own lock, so retention cannot prune a startup snapshot mid-migration.
+    """
+    data_root = Path(workspace_root) / "data"
+    try:
+        data_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BackupError(f"could not prepare database startup lock directory: {exc}") from exc
+    if data_root.is_symlink() or not data_root.is_dir():
+        raise BackupError("database startup lock directory must be a real directory")
+
+    lock_path = data_root / DATABASE_STARTUP_LOCK_FILENAME
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise BackupError(f"could not open database startup lock: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BackupError("database startup lock must be a regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise BackupError(f"could not acquire database startup lock: {exc}") from exc
+        if data_root.is_symlink() or not data_root.is_dir():
+            raise BackupError("database startup lock directory must be a real directory")
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
 
 
 def _utc_now() -> datetime:
@@ -136,28 +220,143 @@ def _next_backup_version(backup_root: Path) -> int:
     return max(versions, default=0) + 1
 
 
+def _prune_backups(backup_root: Path) -> dict[str, int]:
+    """Keep the newest valid managed backups within count and size limits.
+
+    Unknown files, symlinks, and malformed archives are left untouched. The
+    caller holds the thread and filesystem locks and invokes this only after
+    the new archive has been validated and published.
+    """
+    if backup_root.is_symlink() or not backup_root.is_dir():
+        raise BackupError("backup root must be a real directory")
+
+    candidates: list[dict[str, Any]] = []
+    try:
+        children = list(backup_root.iterdir())
+    except OSError as exc:
+        raise BackupError(f"could not inspect backups for retention: {exc}") from exc
+
+    for path in children:
+        match = _MANAGED_BACKUP_FILENAME.fullmatch(path.name)
+        if not match:
+            continue
+        try:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            # Retention recognizes structurally valid archives across schema
+            # versions, even when this app version cannot currently restore
+            # one of those snapshots.
+            manifest = read_backup_manifest(path, expected_schema_version=None)
+            version = int(match.group(1))
+            if manifest["backup_version"] != version:
+                continue
+            candidates.append({
+                "path": path,
+                "version": version,
+                "created_at": datetime.fromisoformat(manifest["created_at"]),
+                "size": metadata.st_size,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+            })
+        except BackupError:
+            # Keep malformed or otherwise unrecognized archives for manual
+            # inspection; they do not count toward managed retention limits.
+            continue
+        except OSError as exc:
+            raise BackupError(f"could not inspect backup {path.name}: {exc}") from exc
+
+    candidates.sort(
+        key=lambda item: (item["version"], item["created_at"], item["path"].name),
+        reverse=True,
+    )
+    keep: list[dict[str, Any]] = []
+    kept_bytes = 0
+    for item in candidates:
+        if len(keep) >= MAX_BACKUP_ARCHIVES:
+            break
+        # Always retain the newest valid archive, even if it exceeds the
+        # aggregate limit by itself. Older archives are then removed.
+        if keep and kept_bytes + item["size"] > MAX_BACKUP_TOTAL_BYTES:
+            break
+        keep.append(item)
+        kept_bytes += item["size"]
+
+    keep_paths = {item["path"] for item in keep}
+    removed = 0
+    for item in candidates:
+        path = item["path"]
+        if path in keep_paths:
+            continue
+        try:
+            current = path.lstat()
+            if (not stat.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (item["device"], item["inode"])):
+                raise BackupError(f"backup changed during retention: {path.name}")
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            # Stop on the first failure. The newly published archive remains
+            # untouched and startup can fail closed without further deletion.
+            raise BackupError(f"could not prune backup {path.name}: {exc}") from exc
+
+    return {"retention_removed": removed, "retention_count": len(keep), "retention_bytes": kept_bytes}
+
+
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), indent=2).encode("utf-8")
 
 
+def _newest_valid_managed_backup(backup_root: Path) -> tuple[Path, dict[str, Any]] | None:
+    """Return the newest structurally valid managed archive across schemas."""
+    candidates: list[tuple[int, Path]] = []
+    for path in backup_root.iterdir():
+        match = _MANAGED_BACKUP_FILENAME.fullmatch(path.name)
+        if match:
+            candidates.append((int(match.group(1)), path))
+    candidates.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    for version, path in candidates:
+        try:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            manifest = read_backup_manifest(path, expected_schema_version=None)
+            if manifest["backup_version"] == version:
+                return path, manifest
+        except (BackupError, OSError):
+            # An invalid or incompatible archive is not a trustworthy baseline.
+            continue
+    return None
+
+
+def _same_snapshot(manifest: dict[str, Any], files: list[dict[str, Any]]) -> bool:
+    def inventory(entries: list[dict[str, Any]]) -> list[tuple[str, int, str]]:
+        return sorted((entry["path"], entry["size"], entry["sha256"]) for entry in entries)
+
+    return inventory(manifest["files"]) == inventory(files)
+
+
 def create_backup(*, database_path: str | Path, generated_root: str | Path, backup_root: str | Path,
-                  schema_version: str = BACKUP_SCHEMA_VERSION) -> dict[str, Any]:
+                  schema_version: str = BACKUP_SCHEMA_VERSION,
+                  skip_if_unchanged: bool = False) -> dict[str, Any]:
     """Create and atomically publish a validated, versioned backup archive.
 
     Version allocation and publication are serialized within this process so
     concurrent requests cannot select the same sequence number.
     """
     with _BACKUP_CREATION_LOCK:
-        return _create_backup(
-            database_path=database_path,
-            generated_root=generated_root,
-            backup_root=backup_root,
-            schema_version=schema_version,
-        )
+        with _backup_process_lock(Path(backup_root)):
+            return _create_backup(
+                database_path=database_path,
+                generated_root=generated_root,
+                backup_root=backup_root,
+                schema_version=schema_version,
+                skip_if_unchanged=skip_if_unchanged,
+            )
 
 
 def _create_backup(*, database_path: str | Path, generated_root: str | Path, backup_root: str | Path,
-                   schema_version: str) -> dict[str, Any]:
+                   schema_version: str, skip_if_unchanged: bool = False) -> dict[str, Any]:
     """Internal implementation; callers should use :func:`create_backup`."""
     if not isinstance(schema_version, str) or not schema_version.strip():
         raise BackupError("schema version must be a non-empty string")
@@ -168,13 +367,7 @@ def _create_backup(*, database_path: str | Path, generated_root: str | Path, bac
     if backups.is_symlink():
         raise BackupError("backup root must not be a symbolic link")
 
-    version = _next_backup_version(backups)
-    created_at = _utc_now().isoformat()
-    stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
-    filename = f"{BACKUP_PREFIX}{version:04d}-{stamp}-{uuid.uuid4().hex[:10]}.zip"
-    final_path = backups / filename
     stage_dir = Path(tempfile.mkdtemp(prefix=".backup-", dir=backups))
-    stage_archive = stage_dir / filename
     snapshot_path = stage_dir / "app.db"
     try:
         _copy_sqlite_snapshot(database, snapshot_path)
@@ -196,6 +389,33 @@ def _create_backup(*, database_path: str | Path, generated_root: str | Path, bac
                 raise BackupError(f"artifact changed while being staged: {member}")
             staged_artifacts.append((staged, member))
             files.append({"path": member, "size": staged.stat().st_size, "sha256": _sha256(staged)})
+
+        if skip_if_unchanged:
+            previous = _newest_valid_managed_backup(backups)
+            if (previous
+                    and previous[1]["schema_version"] == schema_version
+                    and _same_snapshot(previous[1], files)):
+                retention = _prune_backups(backups)
+                return {
+                    "skipped": True,
+                    "reason": "unchanged",
+                    "filename": previous[0].name,
+                    "path": str(previous[0]),
+                    "backup_version": previous[1]["backup_version"],
+                    "format_version": previous[1]["format_version"],
+                    "schema_version": previous[1]["schema_version"],
+                    "created_at": previous[1]["created_at"],
+                    "size": previous[0].stat().st_size,
+                    "artifact_count": len(artifact_files),
+                    **retention,
+                }
+
+        version = _next_backup_version(backups)
+        created_at = _utc_now().isoformat()
+        stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{BACKUP_PREFIX}{version:04d}-{stamp}-{uuid.uuid4().hex[:10]}.zip"
+        final_path = backups / filename
+        stage_archive = stage_dir / filename
         manifest = {
             "format": BACKUP_FORMAT,
             "format_version": BACKUP_FORMAT_VERSION,
@@ -214,7 +434,7 @@ def _create_backup(*, database_path: str | Path, generated_root: str | Path, bac
         # Re-open and verify the archive before it becomes visible to callers.
         read_backup_manifest(stage_archive, expected_schema_version=schema_version)
         os.replace(stage_archive, final_path)
-        return {
+        result = {
             "filename": filename,
             "path": str(final_path),
             "backup_version": version,
@@ -225,6 +445,10 @@ def _create_backup(*, database_path: str | Path, generated_root: str | Path, bac
             "sha256": _sha256(final_path),
             "artifact_count": len(artifact_files),
         }
+        # Prune only after the validated archive is durably visible. A
+        # retention error propagates to startup; the new recovery copy remains.
+        result.update(_prune_backups(backups))
+        return result
     except (OSError, zipfile.BadZipFile) as exc:
         if isinstance(exc, BackupError):
             raise

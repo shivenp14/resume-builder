@@ -18,6 +18,7 @@ export async function request(path, options = {}) {
   if (!response.ok) {
     const error = new Error(errorMessage(data, response.status));
     error.status = response.status;
+    error.detail = data.detail;
     throw error;
   }
   return data;

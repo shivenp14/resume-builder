@@ -7,6 +7,8 @@ __pycache__/
 
 # Local data, generated artifacts, and scratch work
 data/*.db
+data/*.lock
+data/backups/
 generated/
 output/
 tmp/

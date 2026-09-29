@@ -8,7 +8,7 @@ revision snapshots in SQLite.
 
 AI analysis and proposal generation use the locally authenticated Codex CLI;
 the application does not require or store an OpenAI API key. The configured
-defaults are model `gpt-5.6-luna`, low reasoning, and the normal/default
+defaults are model `gpt-6-luna`, low reasoning, and the normal/default
 service tier. Sign in to Codex on the machine running the API before invoking
 the optimization endpoints. Provider calls are read-only, scoped to the
 selected application, and persisted as auditable optimization runs; failures
@@ -107,6 +107,24 @@ saved in `test-results/`.
 
 The API accepts `RESUME_WORKSPACE_ROOT` to isolate database and artifact storage;
 without it, storage remains in the repository as before.
+
+On each backend process start, an existing non-empty database is snapshotted
+before schema creation or startup migrations run. The validated SQLite and
+generated-artifact archive is stored locally under `data/backups/`; startup
+stops with an error if that backup cannot be created. A brand-new or empty
+database is initialized without a backup. Development reloads start a new
+process and check for changes before running migrations. If the WAL-safe
+database snapshot and generated artifacts match the newest valid compatible
+backup, startup logs that it skipped the redundant archive. Manual backup
+requests always create a new archive. Backups are limited to the 10 newest
+valid archives and 512 MiB total. Retention runs after a new archive is
+validated and published, or after an unchanged startup check; it preserves the
+newest archive even if that archive alone exceeds the size limit. Unknown files,
+malformed archives, and symlinks are left untouched. If pruning fails, startup
+stops after keeping the newly published backup. Backups are excluded from Git
+and are local recovery copies, so copy them to a separate location if you need
+protection from disk loss. The backend console logs when the automatic backup
+starts, succeeds (including its path and retention totals), or fails.
 
 ## Seed checkpoint data
 

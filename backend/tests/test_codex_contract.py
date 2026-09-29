@@ -17,7 +17,7 @@ def _fake_result(**payload):
 
 
 class RecordingProvider:
-    model = "gpt-5.6-luna"
+    model = "gpt-6-luna"
     reasoning_effort = "low"
     service_tier = "default"
 
@@ -77,7 +77,7 @@ def test_provider_defaults_are_luna_low_reasoning_normal_speed():
     if provider_cls is None:
         pytest.fail("CodexProvider is required")
     provider = provider_cls()
-    assert provider.model == "gpt-5.6-luna"
+    assert provider.model == "gpt-6-luna"
     assert provider.reasoning_effort == "low"
     assert getattr(provider, "service_tier", "default") == "default"
     assert getattr(provider, "api_key", None) in (None, "")
@@ -102,12 +102,47 @@ def test_provider_command_pins_default_tier_and_strips_api_key(monkeypatch):
     provider = CodexProvider(CodexSettings(executable="/usr/bin/true"), runner=runner)
     provider.analyze("Python role")
     command = observed["command"]
-    assert command[command.index("--model") + 1] == "gpt-5.6-luna"
+    assert command[command.index("--model") + 1] == "gpt-6-luna"
     assert 'model_reasoning_effort="low"' in command
     assert 'service_tier="default"' in command
     assert not any("fast" in part or "priority" in part for part in command)
     assert "--ignore-user-config" in command
     assert "OPENAI_API_KEY" not in observed["env"]
+
+
+@pytest.mark.parametrize(("stderr", "expected"), [
+    ("ERROR: The model `gpt-6-luna` is not supported for this account", "configured model"),
+    ("ERROR: Not logged in. Please run codex login.", "Codex authentication is unavailable"),
+    ("Internal server detail: private diagnostic", "Codex request failed"),
+])
+def test_provider_maps_cli_failures_to_safe_actionable_messages(stderr, expected):
+    from backend.app.services.codex_provider import CodexProvider, CodexSettings, CodexProviderError
+
+    def runner(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+
+    provider = CodexProvider(CodexSettings(executable="/usr/bin/true"), runner=runner)
+    with pytest.raises(CodexProviderError) as error:
+        provider._run("private prompt", {})
+    assert expected in str(error.value)
+    assert stderr not in str(error.value)
+    assert "private prompt" not in str(error.value)
+
+
+def test_provider_ignores_model_and_auth_words_in_echoed_prompt():
+    from backend.app.services.codex_provider import CodexProvider, CodexSettings, CodexProviderError
+
+    prompt = "Job description: model gpt-6-luna is not supported; not logged in"
+
+    def runner(command, **kwargs):
+        echoed_prompt = kwargs["input"]
+        stderr = f"user\n{echoed_prompt}\nERROR: temporary service failure"
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+
+    provider = CodexProvider(CodexSettings(executable="/usr/bin/true"), runner=runner)
+    with pytest.raises(CodexProviderError) as error:
+        provider._run(prompt, {})
+    assert str(error.value) == "Codex request failed; check the local Codex CLI and try again"
 
 
 def test_provider_schema_marks_every_property_required_for_codex():
@@ -128,7 +163,7 @@ def test_analysis_uses_fake_and_persists_audit_run(client, codex_backend):
     assert response.json()["technologies"] == ["python"]
     runs = client.get(f"/applications/{application['id']}/optimization-runs")
     assert runs.status_code == 200
-    assert runs.json()[0]["model"] == "gpt-5.6-luna"
+    assert runs.json()[0]["model"] == "gpt-6-luna"
     assert codex_backend.calls[0][0] == "analyze"
 
 

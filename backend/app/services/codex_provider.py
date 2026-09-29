@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -11,7 +12,7 @@ from pydantic import ValidationError
 from .llm_prompts import analysis_prompt, proposal_prompt
 from .llm_schemas import JobAnalysisOutput, ProposalOutput
 
-MODEL = "gpt-5.6-luna"
+MODEL = "gpt-6-luna"
 REASONING = "low"
 SERVICE_TIER = "default"  # Explicitly normal/default; never fast or priority.
 
@@ -76,7 +77,7 @@ class CodexProvider:
             except OSError as exc:
                 raise CodexProviderError("Codex process could not be started") from exc
         if result.returncode != 0:
-            raise CodexProviderError("Codex request failed; verify local Codex authentication")
+            raise CodexProviderError(self._failure_message(result.stderr, prompt))
         try:
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -84,6 +85,29 @@ class CodexProvider:
         if not isinstance(payload, dict):
             raise CodexProviderError("Codex returned invalid structured output")
         return payload
+
+    @staticmethod
+    def _failure_message(stderr: str | None, prompt: str = "") -> str:
+        """Map CLI error lines to safe messages, ignoring echoed prompt content."""
+        stderr_without_prompt = (stderr or "").replace(prompt, "") if prompt else (stderr or "")
+        error_lines = [
+            line for line in stderr_without_prompt.splitlines()
+            if re.match(r"^\s*(?:error\b|fatal\b)", line, re.IGNORECASE)
+        ]
+        diagnostic = "\n".join(error_lines).casefold()
+        if ("model" in diagnostic and any(marker in diagnostic for marker in (
+            "unsupported", "not supported", "unavailable", "not available", "unknown",
+        ))) or any(marker in diagnostic for marker in (
+            "invalid model", "model does not exist",
+        )):
+            return "Codex does not support the configured model for this account; update the Codex CLI or choose a supported model"
+        if any(marker in diagnostic for marker in (
+            "not logged in", "login required", "run codex login", "please log in",
+            "authentication", "unauthorized", "invalid api key", "api key is invalid",
+            "token expired", "missing credentials", "no authentication", "failed to get token",
+        )) or "401" in diagnostic:
+            return "Codex authentication is unavailable; sign in with `codex login` and retry"
+        return "Codex request failed; check the local Codex CLI and try again"
 
     @staticmethod
     def _codex_schema(schema: dict[str, Any]) -> dict[str, Any]:

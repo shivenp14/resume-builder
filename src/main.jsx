@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ApplicationWorkflows } from './application-workflows.jsx';
+import { ImportPage, Jobs } from './jobs.jsx';
 import {
   SourceLibrary,
   SourceItemCreate,
@@ -25,7 +26,7 @@ function idempotencyKey(prefix) {
 }
 
 const navGroups = [
-  { label: 'Work', items: [['/home', 'Home', 'home'], ['/applications', 'Applications', 'briefcase']] },
+  { label: 'Work', items: [['/home', 'Home', 'home'], ['/jobs', 'Jobs', 'building'], ['/applications', 'Applications', 'briefcase']] },
   {
     label: 'Source records',
     items: [
@@ -50,6 +51,7 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M3 5.5h14M3 10h14M3 14.5h14"/></>,
     close: <><path d="m4.5 4.5 11 11M15.5 4.5l-11 11"/></>,
     arrow: <><path d="M3.5 10h13M12 5.5l4.5 4.5-4.5 4.5"/></>,
+    building: <><path d="M4 17V5.5L10 3l6 2.5V17"/><path d="M2.5 17h15M7 7h.1M10 7h.1M13 7h.1M7 10h.1M10 10h.1M13 10h.1M8.5 17v-3h3v3"/></>,
   };
   return <svg aria-hidden="true" className="icon" width={size} height={size} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
@@ -69,6 +71,7 @@ function Empty({ title, copy, action }) {
 function routeLabel(path) {
   if (path === '/home') return 'Overview';
   if (path.startsWith('/applications')) return 'Applications';
+  if (path.startsWith('/jobs')) return 'Jobs';
   if (path.startsWith('/library')) return 'Source library';
   if (path.startsWith('/skills')) return 'Skills';
   if (path.startsWith('/profiles')) return 'Profiles';
@@ -331,7 +334,7 @@ function ApplicationWorkflowPage({ id, active, go, reload }) {
   const titles = {
     confirmations: ['Confirm source facts', 'Resolve unsupported requirements before adding anything to your reusable source library.'],
     proposal: ['Review proposal', 'Inspect and approve a source-backed selection before generating a revision.'],
-    preview: ['Generate revision', 'Create immutable artifacts from an approved proposal and submit the exact revision you intend to use.'],
+    preview: ['Generate revision', 'Create immutable artifacts, review the exact PDF, then record submission with the revision you uploaded.'],
     revisions: ['Revision history', 'Inspect immutable revisions and compare what changed between them.'],
   };
   const [title, copy] = titles[active];
@@ -343,7 +346,7 @@ function App() {
   const [apps, setApps] = useState([]);
   const [appsError, setAppsError] = useState('');
   const [appsLoading, setAppsLoading] = useState(true);
-  const go = next => { history.pushState({}, '', next); setPath(next); scrollTo({ top: 0, behavior: 'instant' }); };
+  const go = (next, state = {}) => { history.pushState(state, '', next); setPath(next); scrollTo({ top: 0, behavior: 'instant' }); };
   const reload = async () => {
     setAppsLoading(true);
     setAppsError('');
@@ -367,11 +370,14 @@ function App() {
 
   let inner;
   const applicationMatch = path.match(/^\/applications\/(\d+)(?:\/(.*))?$/);
+  const jobImportMatch = path.match(/^\/jobs\/import\/([^/]+)$/);
   const libraryMatch = path.match(/^\/library\/(\d+)$/);
   const skillMatch = path.match(/^\/skills\/(\d+)$/);
   const profileMatch = path.match(/^\/profiles\/(\d+)$/);
   const resumeMatch = path.match(/^\/resumes\/(\d+)$/);
   if (path === '/home') inner = <Home apps={apps} appsError={appsError} appsLoading={appsLoading} reload={reload} go={go} />;
+  else if (path === '/jobs') inner = <Jobs go={go} />;
+  else if (jobImportMatch) inner = <ImportPage id={decodeURIComponent(jobImportMatch[1])} job={history.state?.job} go={go} reloadApplications={reload} />;
   else if (path === '/applications') inner = <Applications apps={apps} appsError={appsError} appsLoading={appsLoading} go={go} reload={reload} />;
   else if (path === '/applications/new') inner = <NewApp go={go} reload={reload} />;
   else if (applicationMatch) {

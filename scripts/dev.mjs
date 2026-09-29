@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { withCodexExecutable } from './codex-executable.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const backendDir = resolve(root, 'backend');
@@ -43,7 +44,7 @@ function stopAll(signal = 'SIGTERM') {
 for (const service of services) {
   const child = spawn(service.command, service.args, {
     cwd: service.cwd,
-    env: process.env,
+    env: service.name === 'backend' ? withCodexExecutable() : process.env,
     stdio: ['inherit', 'pipe', 'pipe'],
   });
   children.set(service.name, child);

@@ -47,40 +47,43 @@
 \begin{document}
 \begin{center}
   \textbf{\Huge \scshape {{ resume.contact.name|default('')|latex }}} \\ \vspace{1pt}
-  {\small {% set contact = namespace(has_value=false) %}{% if resume.contact.location|default('') %}{{ resume.contact.location|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.phone|default('') %}{% if contact.has_value %} $|$ {% endif %}{{ resume.contact.phone|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.email|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{mailto:{{ resume.contact.email|latex }}}{\underline{ {{ resume.contact.email|latex }} }}{% set contact.has_value = true %}{% endif %}{% for field in ['linkedin', 'github', 'website'] %}{% if resume.contact[field]|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{ {{ resume.contact[field]|latex }} }{\underline{ {{ resume.contact[field ~ '_label']|default(resume.contact[field])|latex }} }}{% set contact.has_value = true %}{% endif %}{% endfor %}}
+  % Keep \small ungrouped to preserve the checkpoint's vertical spacing.
+  \small {% set contact = namespace(has_value=false) %}{% if resume.contact.location|default('') %}{{ resume.contact.location|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.phone|default('') %}{% if contact.has_value %} $|$ {% endif %}{{ resume.contact.phone|latex }}{% set contact.has_value = true %}{% endif %}{% if resume.contact.email|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{mailto:{{ resume.contact.email|latex }}}{\underline{ {{- resume.contact.email|latex -}} }}{% set contact.has_value = true %}{% endif %}{% for field in ['linkedin', 'github', 'website'] %}{% if resume.contact[field]|default('') %}{% if contact.has_value %} $|$ {% endif %}\href{ {{- resume.contact[field]|latex -}} }{\underline{ {{- resume.contact[field ~ '_label']|default(resume.contact[field])|latex -}} }}{% set contact.has_value = true %}{% endif %}{% endfor %}
 \end{center}
 {% for section in resume.sections|default([]) %}
 {% set section_key = section.key|default(section.title|lower) %}
-\section{ {{ section.title|latex }} }
+\section{ {{- section.title|latex -}} }
 {% if section_key == 'skills' %}
 \begin{itemize}[leftmargin=0.15in,label={}]
-  \small{\item{% for group in section.skill_groups|default([]) %}\textbf{ {{ group.category|latex }} }{: {{ group.skills|join(', ')|latex }}}{% if not loop.last %} \\{% endif %}{% endfor %}}
+  \small{\item{% for group in section.skill_groups|default([]) %}\textbf{ {{- group.category|latex -}}}{: {{ group.skills|join(', ')|latex }}}{% if not loop.last %} \\{% endif %}{% endfor %}}
 \end{itemize}
 {% elif section_key in ['objective','professional summary','professional_summary'] %}
-{% for entry in section.entries|default([]) %}{% if entry.summary|default('') %}\small{ {{ entry.summary|latex }} }{% endif %}{% for bullet in entry.bullets|default([]) %}\resumeItemListStart
-\resumeItem{ {{ bullet.text|latex }} }
+{% for entry in section.entries|default([]) %}{% if entry.summary|default('') %}\small{ {{- entry.summary|latex -}} }{% endif %}{% for bullet in entry.bullets|default([]) %}\resumeItemListStart
+\resumeItem{ {{- bullet.text|latex -}} }
 \resumeItemListEnd{% endfor %}{% endfor %}
 {% elif section_key == 'activities' %}
 \begin{itemize}[leftmargin=0.15in,label={}]
-{% for entry in section.entries|default([]) %}{% if entry.title|default('') and entry.summary|default('') %}\item\small{\textbf{ {{ entry.title|latex }} }: {{ entry.summary|latex }}}
-{% elif entry.title|default('') %}\item\small{ {{ entry.title|latex }} }
-{% elif entry.summary|default('') %}\item\small{ {{ entry.summary|latex }} }
-{% endif %}{% for bullet in entry.bullets|default([]) %}\item\small{ {{ bullet.text|latex }} }
+{% for entry in section.entries|default([]) %}{% if entry.title|default('') and entry.summary|default('') %}{% if entry.title|lower == section.title|lower %}\item\small{ {{- entry.summary|latex -}} }
+{% else %}\item\small{\textbf{ {{- entry.title|latex -}} }: {{ entry.summary|latex -}}}
+{% endif %}{% elif entry.title|default('') %}\item\small{ {{- entry.title|latex -}} }
+{% elif entry.summary|default('') %}\item\small{ {{- entry.summary|latex -}} }
+{% endif %}{% for bullet in entry.bullets|default([]) %}\item\small{ {{- bullet.text|latex -}} }
 {% endfor %}{% endfor %}\end{itemize}
 {% else %}
 \resumeSubHeadingListStart
 {% for entry in section.entries|default([]) %}
 {% if section_key == 'project' %}
-\resumeProjectHeading{\textbf{ {{ entry.title|latex }} }{% if entry.skills|default('') %} $|$ \emph{ {{ entry.skills|latex }} }{% endif %}}{ {{ entry.dates|default('')|latex }} }
+\resumeProjectHeading{\textbf{ {{- entry.title|latex -}} }{% if entry.skills|default('') %} $|$ \emph{ {{- entry.skills|latex -}} }{% endif %}}{ {{- entry.dates|default('')|latex -}} }
 {% elif section_key == 'education' %}
-\resumeSubheading{ {{ entry.organization|default(entry.title, true)|latex }} }{ {{ entry.location|default('')|latex }} }{ {{ entry.display_title|default(entry.title)|latex }} }{ {{ entry.dates|default('')|latex }} }
+\resumeSubheading{ {{- entry.organization|default(entry.title, true)|latex -}} }{ {{- entry.location|default('')|latex -}} }{ {{- entry.display_title|default(entry.title)|latex -}} }{ {{- entry.dates|default('')|latex -}} }
 {% else %}
-\resumeSubheading{ {{ entry.organization|default(entry.title, true)|latex }} }{ {{ entry.dates|default('')|latex }} }{ {{ entry.display_title|default(entry.title)|latex }} }{ {{ entry.location|default('')|latex }} }
+{% set subtitle_parts = (entry.display_title|default(entry.title)).split(' | ') %}
+\resumeSubheading{ {{- entry.organization|default(entry.title, true)|latex -}} }{ {{- entry.dates|default('')|latex -}} }{ {%- for part in subtitle_parts %}{% if not loop.first %} $|$ {% endif %}{{ part|latex }}{%- endfor %} }{ {{- entry.location|default('')|latex -}} }
 {% endif %}
 {% if entry.summary|default('') or entry.bullets|default([]) %}\resumeItemListStart
-{% if entry.summary|default('') %}\resumeItem{ {{ entry.summary|latex }} }
+{% if entry.summary|default('') %}\resumeItem{ {{- entry.summary|latex -}} }
 {% endif %}
-{% for bullet in entry.bullets|default([]) %}\resumeItem{ {{ bullet.text|latex }} }
+{% for bullet in entry.bullets|default([]) %}\resumeItem{ {{- bullet.text|latex -}} }
 {% endfor %}\resumeItemListEnd{% endif %}
 {% endfor %}
 \resumeSubHeadingListEnd

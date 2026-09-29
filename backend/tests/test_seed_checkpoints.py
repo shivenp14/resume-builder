@@ -154,3 +154,54 @@ def test_migration_rolls_back_all_changes_on_failure(migration_db, monkeypatch):
         assert "contact" not in base.layout_settings
         assert bullet.supporting_facts == []
         assert bullet.is_locked is True
+
+
+def test_checkpoint_parser_preserves_skill_group_and_skill_order(tmp_path):
+    path=tmp_path / "resume.tex"
+    path.write_text(r"""\section{Technical Skills}
+\textbf{Programming}{: Python, Java, SQL} \\
+\textbf{Web \& Backend}{: FastAPI, React, Vite}
+\section{Activities}
+""")
+
+    assert seed_checkpoints._checkpoint_skill_groups(path) == [
+        {"category":"Programming","skills":["Python","Java","SQL"]},
+        {"category":"Web & Backend","skills":["FastAPI","React","Vite"]},
+    ]
+
+
+def test_checkpoint_contact_keeps_linkedin_trailing_slash(tmp_path):
+    path=tmp_path / "resume.tex"
+    path.write_text(r"""\begin{document}
+\begin{center}
+\textbf{\Huge \scshape Example Person} \\
+\small Hoboken, NJ $|$ \href{https://linkedin.com/in/example/}{\underline{linkedin.com/in/example/}}
+\end{center}
+\end{document}
+""")
+
+    assert seed_checkpoints.parse_contact(path)["linkedin_label"] == "linkedin.com/in/example/"
+
+
+def test_checkpoint_migration_backfills_order_without_overwriting_saved_order(migration_db):
+    session_local=migration_db
+    folder=seed_checkpoints.CHECKPOINTS / "baseline-2026-07-27"
+    folder.joinpath("resume.tex").write_text(r"""\section{Technical Skills}
+\textbf{Programming}{: Python, Java, SQL}
+\section{Experience}
+""")
+    with session_local() as session:
+        base_id, _, _ = _add_source(session, owner="Shiven Pandya")
+        custom_id, _, _ = _add_source(session, owner="Shiven Pandya")
+        custom=session.get(main.BaseResume,custom_id)
+        custom.layout_settings={**custom.layout_settings,"skill_groups":[{"category":"Custom","skills":["Reordered"]}]}
+        session.commit()
+
+    seed_checkpoints.migrate_verified()
+    with session_local() as session:
+        assert session.get(main.BaseResume,base_id).layout_settings["skill_groups"] == [
+            {"category":"Programming","skills":["Python","Java","SQL"]}
+        ]
+        assert session.get(main.BaseResume,custom_id).layout_settings["skill_groups"] == [
+            {"category":"Custom","skills":["Reordered"]}
+        ]

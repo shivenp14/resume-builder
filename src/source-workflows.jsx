@@ -213,7 +213,51 @@ export function ProfileDetail({ id, go, onChanged }) { const state = useLoad(() 
 export const ProfileEdit = ProfileDetail;
 
 const resumeDefaults = { name: '', template_id: 'default', section_order: '', layout_settings: '{}', personal_information_id: '' };
-function ResumeForm({ resume, profiles = [], onSaved, onCancel, create = false }) { const [form, setForm] = useState({ ...resumeDefaults, ...(resume || {}), section_order: textValue(resume?.section_order), layout_settings: JSON.stringify(resume?.layout_settings || {}, null, 2), personal_information_id: resume?.personal_information_id || '' }); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const set = (key,value) => setForm(v => ({ ...v, [key]: value })); const submit = async e => { e.preventDefault(); setBusy(true); setError(''); let settings; try { settings = JSON.parse(form.layout_settings || '{}'); } catch { setError('Layout settings must be valid JSON.'); setBusy(false); return; } const payload = { name: String(form.name || '').trim(), template_id: String(form.template_id || 'default').trim() || 'default', section_order: listValue(form.section_order), layout_settings: settings, personal_information_id: form.personal_information_id ? Number(form.personal_information_id) : null }; try { const saved = await sourceRequest(create ? '/base-resumes' : `/base-resumes/${resume.id}`, { method: create ? 'POST' : 'PATCH', body: json(payload) }); onSaved?.(saved); } catch (err) { setError(err.message); } finally { setBusy(false); } }; return <form className="form-card" onSubmit={submit}><div className="form-grid"><label>Name<input required value={form.name} onChange={e => set('name', e.target.value)} /></label><label>Template ID<input value={form.template_id} onChange={e => set('template_id', e.target.value)} /></label><label className="full">Section order<input value={form.section_order} onChange={e => set('section_order', e.target.value)} placeholder="experience, education, projects" /></label><label>Personal profile<select value={String(form.personal_information_id || '')} onChange={e => set('personal_information_id', e.target.value)}><option value="">No profile</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name || `Profile ${profile.id}`}</option>)}</select></label><label className="full">Layout settings JSON<textarea rows="4" value={form.layout_settings} onChange={e => set('layout_settings', e.target.value)} /></label></div><ErrorText error={error} /><div className="form-actions">{onCancel && <Button kind="ghost" onClick={onCancel}>Cancel</Button>}<Button type="submit" disabled={busy}>{busy ? 'Saving…' : create ? 'Create base resume' : 'Save resume'}</Button></div></form>; }
+function ResumeForm({ resume, profiles = [], onSaved, onCancel, create = false }) {
+  const initialSettings = resume?.layout_settings || {};
+  const [form, setForm] = useState({ ...resumeDefaults, ...(resume || {}), section_order: textValue(resume?.section_order), layout_settings: JSON.stringify(initialSettings, null, 2), personal_information_id: resume?.personal_information_id || '' });
+  const hasSavedSkillOrder = Object.prototype.hasOwnProperty.call(initialSettings, 'skill_groups');
+  const [skillGroupsText, setSkillGroupsText] = useState((initialSettings.skill_groups || []).map(group => `${group.category}: ${(group.skills || []).join(', ')}`).join('\n'));
+  const [hasSkillOrder, setHasSkillOrder] = useState(hasSavedSkillOrder);
+  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const set = (key,value) => setForm(v => ({ ...v, [key]: value }));
+  useEffect(() => {
+    if (hasSavedSkillOrder) return;
+    sourceRequest('/skills').then(skills => {
+      if (!skills.length) return;
+      const groups = [];
+      skills.forEach(skill => {
+        if (!skill.verified) return;
+        const category = skill.category || 'Skills';
+        let group = groups.find(item => item.category === category);
+        if (!group) { group = { category, skills: [] }; groups.push(group); }
+        group.skills.push(skill.name);
+      });
+      groups.sort((a, b) => a.category.localeCompare(b.category));
+      groups.forEach(group => group.skills.sort((a, b) => a.localeCompare(b)));
+      if (groups.length) setSkillGroupsText(groups.map(group => `${group.category}: ${group.skills.join(', ')}`).join('\n'));
+    }).catch(() => {});
+  }, [hasSavedSkillOrder]);
+  const submit = async e => {
+    e.preventDefault(); setBusy(true); setError('');
+    let settings;
+    try { settings = JSON.parse(form.layout_settings || '{}'); }
+    catch { setError('Layout settings must be valid JSON.'); setBusy(false); return; }
+    const parsedGroups = skillGroupsText.split('\n').map(line => {
+      const separator = line.indexOf(':');
+      if (separator < 0) return null;
+      const category = line.slice(0, separator).trim();
+      const skills = line.slice(separator + 1).split(',').map(skill => skill.trim()).filter(Boolean);
+      return category && skills.length ? { category, skills } : null;
+    }).filter(Boolean);
+    if (hasSkillOrder || skillGroupsText.trim()) settings.skill_groups = parsedGroups;
+    const payload = { name: String(form.name || '').trim(), template_id: String(form.template_id || 'default').trim() || 'default', section_order: listValue(form.section_order), layout_settings: settings, personal_information_id: form.personal_information_id ? Number(form.personal_information_id) : null };
+    try { const saved = await sourceRequest(create ? '/base-resumes' : `/base-resumes/${resume.id}`, { method: create ? 'POST' : 'PATCH', body: json(payload) }); onSaved?.(saved); }
+    catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  return <form className="form-card" onSubmit={submit}><div className="form-grid"><label>Name<input required value={form.name} onChange={e => set('name', e.target.value)} /></label><label>Template ID<input value={form.template_id} onChange={e => set('template_id', e.target.value)} /></label><label className="full">Section order<input value={form.section_order} onChange={e => set('section_order', e.target.value)} placeholder="experience, education, projects" /></label><label>Personal profile<select value={String(form.personal_information_id || '')} onChange={e => set('personal_information_id', e.target.value)}><option value="">No profile</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name || `Profile ${profile.id}`}</option>)}</select></label><label className="full">Skills in display order<textarea rows="4" value={skillGroupsText} onChange={e => { setSkillGroupsText(e.target.value); setHasSkillOrder(true); }} placeholder="Programming: Python, Java, SQL\nWeb & Backend: FastAPI, React" /><small>One category per line. Keep skills comma separated; their order is saved as shown.</small></label><label className="full">Layout settings JSON<textarea rows="4" value={form.layout_settings} onChange={e => set('layout_settings', e.target.value)} /></label></div><ErrorText error={error} /><div className="form-actions">{onCancel && <Button kind="ghost" onClick={onCancel}>Cancel</Button>}<Button type="submit" disabled={busy}>{busy ? 'Saving…' : create ? 'Create base resume' : 'Save resume'}</Button></div></form>;
+}
 
 function EntryEditor({ resumeId, entry, items, onSaved, onCancel }) { const [itemId, setItemId] = useState(String(entry?.content_item_id || '')); const [bulletIds, setBulletIds] = useState((entry?.selected_bullet_ids || []).map(String)); const [order, setOrder] = useState(entry?.entry_order ?? 0); const [bullets, setBullets] = useState([]); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); useEffect(() => { if (!itemId) { setBullets([]); return; } sourceRequest(`/content-items/${itemId}/bullets`).then(setBullets).catch(err => setError(err.message)); }, [itemId]); const submit = async e => { e.preventDefault(); setBusy(true); setError(''); try { const payload = { content_item_id: Number(itemId), selected_bullet_ids: bulletIds.map(Number), entry_order: Number(order) }; const saved = await sourceRequest(entry ? `/base-entries/${entry.id}` : `/base-resumes/${resumeId}/entries`, { method: entry ? 'PATCH' : 'POST', body: json(payload) }); onSaved?.(saved); } catch (err) { setError(err.message); } finally { setBusy(false); } }; const selectableItems = items.filter(item => !item.is_archived || item.id === entry?.content_item_id); return <form className="form-card" onSubmit={submit}><div className="form-grid"><label className="full">Source item<select required value={itemId} onChange={e => { setItemId(e.target.value); setBulletIds([]); }}><option value="">Select source item…</option>{selectableItems.map(item => <option key={item.id} value={item.id}>{item.title}{item.is_archived ? ' · archived reference' : ''}</option>)}</select></label><label>Entry order<input type="number" min="0" value={order} onChange={e => setOrder(e.target.value)} /></label><label className="full">Selected bullets<select multiple value={bulletIds} onChange={e => setBulletIds([...e.target.selectedOptions].map(option => option.value))}>{bullets.map(bullet => <option key={bullet.id} value={bullet.id}>{bullet.text}</option>)}</select><small>Select exact bullets for this resume entry. Hold Command/Ctrl for multiple.</small></label></div><ErrorText error={error} /><div className="form-actions">{onCancel && <Button kind="ghost" onClick={onCancel}>Cancel</Button>}<Button type="submit" disabled={busy || !itemId}>{busy ? 'Saving…' : entry ? 'Save entry' : 'Add entry'}</Button></div></form>; }
 

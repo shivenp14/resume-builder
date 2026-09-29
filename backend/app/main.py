@@ -4,18 +4,19 @@ The API deliberately keeps AI output as proposals: source records and revisions
 are never silently changed by analysis or optimization.
 """
 from datetime import datetime, timezone
-import base64, copy, hashlib, json, os, re, shutil, tempfile
+import base64, copy, hashlib, json, logging, os, re, shutil, tempfile
 from io import BytesIO
 from pathlib import Path
 import threading
 from typing import Any, Literal
 import uuid
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from fastapi import FastAPI, Depends, Header, HTTPException, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
-from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, CheckConstraint, event, func, or_, text, inspect
+from sqlalchemy import create_engine, String, Text, Integer, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint, CheckConstraint, Index, event, func, or_, text, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from .services.renderer import ResumeRenderer, count_pdf_pages
@@ -31,7 +32,16 @@ from .services.matching import (
     WEAKLY_REPRESENTED_THRESHOLD,
     score_requirement,
 )
-from .services.backup import BackupError, create_backup as create_backup_archive, list_backups as list_backup_archives
+from .services.backup import (
+    BackupError,
+    create_backup as create_backup_archive,
+    database_startup_lock,
+    list_backups as list_backup_archives,
+)
+from .services.job_description import fetch_job_description_async
+from .services.simplify_listings import ListingsFeedError, get_listings
+
+logger = logging.getLogger("uvicorn.error")
 
 ROOT = Path(os.environ.get("RESUME_WORKSPACE_ROOT", Path(__file__).resolve().parents[2])).resolve()
 DB_PATH = ROOT / "data" / "app.db"
@@ -130,13 +140,53 @@ class PersonalInformation(Base):
 class BaseResume(Base):
     __tablename__="base_resumes"
     id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); template_id: Mapped[str]=mapped_column(String(80),default="default"); section_order: Mapped[list]=mapped_column(JSON,default=list); layout_settings: Mapped[dict]=mapped_column(JSON,default=dict); personal_information_id: Mapped[int|None]=mapped_column(ForeignKey("personal_information.id"),nullable=True)
+
+def _checkpoint_skill_groups(path: Path) -> list[dict[str,Any]]:
+    """Read ordered skill groups from a checkpoint TeX resume."""
+    try:
+        text=path.read_text(errors="replace")
+    except OSError:
+        return []
+    match=re.search(r"\\section\{(?:Technical Skills|Relevant Skills)\}(.*?)(?=\\section\{|\\end\{document\})",text,re.S|re.I)
+    if not match:
+        return []
+    groups=[]
+    for category,raw_skills in re.findall(r"\\textbf\{([^{}]*)\}\s*\{:\s*([^{}]*)\}",match.group(1)):
+        category=re.sub(r"\\[A-Za-z]+\*?(?:\[[^]]*\])?", "", category).replace(r"\&","&").strip()
+        skills=[]
+        for value in raw_skills.split(","):
+            value=re.sub(r"\\[A-Za-z]+\*?(?:\[[^]]*\])?", "", value).replace(r"\&","&").strip()
+            value=re.sub(r"^and\s+", "", value, flags=re.I)
+            value=re.sub(r"\s+", " ", value).strip(" .")
+            if value and value not in skills:
+                skills.append(value)
+        if category and skills:
+            groups.append({"category":category,"skills":skills})
+    return groups
+
+def _backfill_checkpoint_skill_groups(base: BaseResume) -> bool:
+    """Backfill only absent order data; key presence marks intentional edits."""
+    settings=dict(base.layout_settings or {})
+    if "skill_groups" in settings:
+        return False
+    slug=settings.get("checkpoint")
+    if not isinstance(slug,str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*",slug):
+        return False
+    groups=_checkpoint_skill_groups(ROOT / "checkpoints" / slug / "resume.tex")
+    if not groups:
+        return False
+    settings["skill_groups"]=groups
+    base.layout_settings=settings
+    return True
+
 class BaseEntry(Base):
     __tablename__="base_entries"
     __table_args__=(UniqueConstraint("base_resume_id", "content_item_id", name="uq_base_entry_resume_item"),)
     id: Mapped[int]=mapped_column(primary_key=True); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); content_item_id: Mapped[int]=mapped_column(ForeignKey("content_items.id")); selected_bullet_ids: Mapped[list]=mapped_column(JSON,default=list); entry_order: Mapped[int]=mapped_column(Integer,default=0)
 class Application(Base):
     __tablename__="applications"
-    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); job_description_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False); job_description_fingerprint: Mapped[str]=mapped_column(String(64),default="",nullable=False); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); source: Mapped[str|None]=mapped_column(String(120)); location: Mapped[str|None]=mapped_column(String(200)); employment_type: Mapped[str|None]=mapped_column(String(80)); salary_range: Mapped[str|None]=mapped_column(String(120)); contact_name: Mapped[str|None]=mapped_column(String(200)); contact_email: Mapped[str|None]=mapped_column(String(320)); application_deadline: Mapped[str|None]=mapped_column(String(40)); applied_at: Mapped[str|None]=mapped_column(String(40)); follow_up_at: Mapped[str|None]=mapped_column(String(40)); submitted_revision_id: Mapped[int|None]=mapped_column(ForeignKey("revisions.id"),nullable=True); submitted_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
+    __table_args__=(Index("uq_applications_source_listing_id","source_listing_id",unique=True,sqlite_where=text("source_listing_id IS NOT NULL")),)
+    id: Mapped[int]=mapped_column(primary_key=True); company: Mapped[str]=mapped_column(String(200)); position: Mapped[str]=mapped_column(String(200)); job_url: Mapped[str|None]=mapped_column(String(500)); job_description: Mapped[str]=mapped_column(Text); job_description_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False); job_description_fingerprint: Mapped[str]=mapped_column(String(64),default="",nullable=False); notes: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(30),default="draft"); base_resume_id: Mapped[int]=mapped_column(ForeignKey("base_resumes.id")); source: Mapped[str|None]=mapped_column(String(120)); source_listing_id: Mapped[str|None]=mapped_column(String(240),nullable=True); simplify_url: Mapped[str|None]=mapped_column(String(500),nullable=True); location: Mapped[str|None]=mapped_column(String(200)); employment_type: Mapped[str|None]=mapped_column(String(80)); salary_range: Mapped[str|None]=mapped_column(String(120)); contact_name: Mapped[str|None]=mapped_column(String(200)); contact_email: Mapped[str|None]=mapped_column(String(320)); application_deadline: Mapped[str|None]=mapped_column(String(40)); applied_at: Mapped[str|None]=mapped_column(String(40)); follow_up_at: Mapped[str|None]=mapped_column(String(40)); submitted_revision_id: Mapped[int|None]=mapped_column(ForeignKey("revisions.id"),nullable=True); submitted_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); updated_at: Mapped[datetime]=mapped_column(DateTime,default=now,onupdate=now)
 class ApplicationStatusHistory(Base):
     __tablename__="application_status_history"
     id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); from_status: Mapped[str|None]=mapped_column(String(30),nullable=True); to_status: Mapped[str]=mapped_column(String(30)); reason: Mapped[str|None]=mapped_column(Text,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
@@ -255,7 +305,7 @@ ConfirmedSourceRecord = ConfirmationMaterialization
 SourceMaterialization = ConfirmationMaterialization
 class OptimizationRun(Base):
     __tablename__="optimization_runs"
-    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); operation: Mapped[str]=mapped_column(String(40)); status: Mapped[str]=mapped_column(String(20),default="running"); model: Mapped[str]=mapped_column(String(100),default="gpt-5.6-luna"); reasoning_effort: Mapped[str]=mapped_column(String(20),default="low"); prompt_version: Mapped[str]=mapped_column(String(40),default="v1"); schema_version: Mapped[str]=mapped_column(String(40),default="v1"); idempotency_key: Mapped[str|None]=mapped_column(String(200)); input_payload: Mapped[dict]=mapped_column(JSON,default=dict); output_payload: Mapped[dict|None]=mapped_column(JSON); error: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
+    id: Mapped[int]=mapped_column(primary_key=True); application_id: Mapped[int]=mapped_column(ForeignKey("applications.id")); operation: Mapped[str]=mapped_column(String(40)); status: Mapped[str]=mapped_column(String(20),default="running"); model: Mapped[str]=mapped_column(String(100),default=MODEL); reasoning_effort: Mapped[str]=mapped_column(String(20),default="low"); prompt_version: Mapped[str]=mapped_column(String(40),default="v1"); schema_version: Mapped[str]=mapped_column(String(40),default="v1"); idempotency_key: Mapped[str|None]=mapped_column(String(200)); input_payload: Mapped[dict]=mapped_column(JSON,default=dict); output_payload: Mapped[dict|None]=mapped_column(JSON); error: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
 class ContentItemVersion(Base):
     """Immutable point-in-time copy of a content item.
 
@@ -298,7 +348,61 @@ class BulletVersion(Base):
     changed_fields: Mapped[list]=mapped_column(JSON,default=list)
     snapshot: Mapped[dict]=mapped_column(JSON,default=dict)
     created_at: Mapped[datetime]=mapped_column(DateTime,default=now)
-Base.metadata.create_all(engine)
+
+def _backup_existing_database_before_schema_changes() -> None:
+    """Protect an existing database before create_all or startup migrations run."""
+    try:
+        if not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            f"Startup aborted: could not inspect the existing database before schema changes: {exc}"
+        ) from exc
+
+    logger.info("Starting automatic backup before database schema changes")
+    try:
+        backup = create_backup_archive(
+            database_path=DB_PATH,
+            generated_root=ROOT / "generated",
+            backup_root=ROOT / "data" / "backups",
+            skip_if_unchanged=True,
+        )
+    except Exception as exc:
+        logger.error("Automatic backup failed; aborting startup (creation or retention): %s", exc)
+        # Fail closed: schema creation and data backfills must not proceed if a
+        # recoverable snapshot could not be validated and published.
+        raise RuntimeError(
+            f"Startup aborted: could not create a validated backup and apply retention before schema changes: {exc}"
+        ) from exc
+    if backup.get("skipped"):
+        logger.info(
+            "Automatic backup skipped: data is unchanged since %s; retention removed %d old backup(s), "
+            "leaving %d valid archive(s) totaling %d bytes",
+            backup["path"],
+            backup.get("retention_removed", 0),
+            backup.get("retention_count", 0),
+            backup.get("retention_bytes", 0),
+        )
+        return
+    logger.info(
+        "Automatic backup succeeded: %s; retention removed %d old backup(s), "
+        "leaving %d valid archive(s) totaling %d bytes",
+        backup["path"],
+        backup.get("retention_removed", 0),
+        backup.get("retention_count", 0),
+        backup.get("retention_bytes", 0),
+    )
+
+
+def _initialize_schema_after_backup() -> None:
+    _backup_existing_database_before_schema_changes()
+    Base.metadata.create_all(engine)
+
+
+def _initialize_database_schema() -> None:
+    """Back up and create the base schema under the cross-process startup lock."""
+    with database_startup_lock(ROOT):
+        _initialize_schema_after_backup()
 
 _CONTENT_VERSION_FIELDS=("type","title","organization","location","start_date","end_date","summary","tags","is_archived")
 _BULLET_VERSION_FIELDS=("text","tags","supporting_facts","is_locked","is_preferred")
@@ -778,6 +882,8 @@ def _apply_sqlite_integrity_migrations() -> None:
         # by an inspector check.
         columns = {
             "job_url": "VARCHAR(500)",
+            "source_listing_id": "VARCHAR(240)",
+            "simplify_url": "VARCHAR(500)",
             "notes": "TEXT",
             "job_description_version": "INTEGER NOT NULL DEFAULT 1",
             "job_description_fingerprint": "VARCHAR(64) NOT NULL DEFAULT ''",
@@ -797,6 +903,7 @@ def _apply_sqlite_integrity_migrations() -> None:
         for name, declaration in columns.items():
             if name not in existing:
                 connection.execute(text(f"ALTER TABLE applications ADD COLUMN {name} {declaration}"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_source_listing_id ON applications(source_listing_id) WHERE source_listing_id IS NOT NULL"))
         base_resume_columns = {column["name"] for column in inspect(connection).get_columns("base_resumes")}
         if "personal_information_id" not in base_resume_columns:
             connection.execute(text("ALTER TABLE base_resumes ADD COLUMN personal_information_id INTEGER"))
@@ -1089,7 +1196,14 @@ def _apply_sqlite_integrity_migrations() -> None:
                 _append_bullet_version(session,bullet,action="backfill",changed_fields=list(_BULLET_VERSION_FIELDS))
         session.commit()
 
-_apply_sqlite_integrity_migrations()
+def _initialize_application_storage() -> None:
+    """Hold one startup lock through backup, schema creation, and migrations."""
+    with database_startup_lock(ROOT):
+        _initialize_schema_after_backup()
+        _apply_sqlite_integrity_migrations()
+
+
+_initialize_application_storage()
 def db():
     # A database session belongs to one request, but it must not serialize the
     # request.  Analysis and generation deliberately perform provider/compiler
@@ -1152,6 +1266,8 @@ class AppIn(BaseModel):
     base_resume_id:int
     status:str="draft"
     job_url:str|None=None
+    source_listing_id:str|None=None
+    simplify_url:str|None=None
     notes:str|None=None
     source:str|None=None
     location:str|None=None
@@ -1169,6 +1285,7 @@ class AppPatch(BaseModel):
     job_description:str|None=None
     base_resume_id:int|None=None
     job_url:str|None=None
+    simplify_url:str|None=None
     notes:str|None=None
     status:str|None=None
     status_reason:str|None=None
@@ -1190,6 +1307,71 @@ class StatusChangeIn(BaseModel):
 class SubmitRevisionIn(BaseModel):
     revision_id:int
     submitted_at:datetime|None=None
+class JobDescriptionRequest(BaseModel):
+    url:str
+
+def _validated_http_url(value:str|None, field_name:str) -> str|None:
+    if value is None:
+        return None
+    try:
+        parsed=urlsplit(value.strip())
+        _=parsed.port  # Accessing port validates malformed and out-of-range values.
+        valid=parsed.scheme.lower() in {"http","https"} and bool(parsed.hostname) and not parsed.username and not parsed.password
+    except (TypeError, ValueError):
+        valid=False
+    if not valid:
+        raise HTTPException(422,f"{field_name} must be an http or https URL")
+    return value.strip()
+
+def _normalized_employer_url(value:str|None) -> str|None:
+    """Normalize only URL differences that cannot select a different job.
+
+    Host/scheme case, default ports, fragments, query ordering, and common
+    analytics parameters do not affect the employer resource. Other query
+    parameters and the path remain exact so distinct requisitions are not
+    merged accidentally.
+    """
+    if not value:
+        return None
+    try:
+        parsed=urlsplit(value.strip())
+        port=parsed.port
+        host=(parsed.hostname or "").lower()
+        if parsed.scheme.lower() not in {"http","https"} or not host or parsed.username or parsed.password:
+            return None
+        scheme=parsed.scheme.lower()
+        if port is not None and not ((scheme=="http" and port==80) or (scheme=="https" and port==443)):
+            host=f"{host}:{port}"
+        if ":" in parsed.hostname and not parsed.hostname.startswith("["):
+            host=f"[{parsed.hostname.lower()}]" + (f":{port}" if port is not None and port not in (80,443) else "")
+        tracking={"gclid","fbclid","mc_cid","mc_eid"}
+        query_pairs=[(key,item) for key,item in parse_qsl(parsed.query,keep_blank_values=True)
+                     if not key.lower().startswith("utm_") and key.lower() not in tracking]
+        query=urlencode(sorted(query_pairs))
+        return f"{scheme}://{host}{parsed.path or '/'}" + (f"?{query}" if query else "")
+    except (TypeError,ValueError):
+        return None
+
+def _job_identity(company:str|None,position:str|None,url:str|None) -> tuple[str,str,str]|None:
+    normalized_url=_normalized_employer_url(url)
+    if not normalized_url or not company or not position:
+        return None
+    clean=lambda value:" ".join(value.casefold().split())
+    return normalized_url,clean(company),clean(position)
+
+def _matching_existing_application(s:Session, *, listing_id:str|None, company:str,
+                                   position:str, job_url:str|None) -> Application|None:
+    if listing_id:
+        match=s.query(Application).filter_by(source_listing_id=listing_id).first()
+        if match:
+            return match
+    identity=_job_identity(company,position,job_url)
+    if identity is None:
+        return None
+    for application in s.query(Application).filter(Application.job_url.is_not(None)).order_by(Application.id).all():
+        if _job_identity(application.company,application.position,application.job_url)==identity:
+            return application
+    return None
 class EvidenceLinkIn(BaseModel):
     """A link to one or more concrete, verified source records."""
     source_type:str|None=None
@@ -1276,7 +1458,7 @@ class PersonalInformationOut(APIOut):
 class BaseResumeOut(APIOut): id:int; name:str; template_id:str; section_order:list[str]; layout_settings:dict[str,Any]; personal_information_id:int|None
 class BaseEntryOut(APIOut): id:int; base_resume_id:int; content_item_id:int; selected_bullet_ids:list[int]; entry_order:int
 class ApplicationOut(APIOut):
-    id:int; company:str; position:str; job_url:str|None; job_description:str; job_description_version:int; job_description_fingerprint:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
+    id:int; company:str; position:str; job_url:str|None; source_listing_id:str|None=None; simplify_url:str|None=None; job_description:str; job_description_version:int; job_description_fingerprint:str; notes:str|None; status:str; base_resume_id:int; source:str|None; location:str|None; employment_type:str|None; salary_range:str|None; contact_name:str|None; contact_email:str|None; application_deadline:str|None; applied_at:str|None; follow_up_at:str|None; submitted_revision_id:int|None; submitted_at:datetime|None; created_at:datetime; updated_at:datetime
 class StatusHistoryOut(APIOut):
     id:int; application_id:int; from_status:str|None; to_status:str; status:str; reason:str|None; created_at:datetime; changed_at:datetime
 class JobAnalysisOut(APIOut):
@@ -1388,7 +1570,7 @@ def create_backup_endpoint():
     The response contains metadata only. The archive remains on the local
     machine under ``data/backups`` and is never streamed through this API.
     """
-    with OPERATION_BARRIER:
+    with OPERATION_BARRIER, database_startup_lock(ROOT):
         try:
             record = create_backup_archive(
                 database_path=_active_database_path(),
@@ -1805,11 +1987,14 @@ def add_resume(x:ResumeIn,s:Session=Depends(db)):
 @app.get("/base-resumes",response_model=list[BaseResumeOut])
 def resumes(s:Session=Depends(db)):
     records=s.query(BaseResume).all()
+    changed=any([_backfill_checkpoint_skill_groups(record) for record in records])
+    if changed: s.commit()
     return sorted(records,key=lambda record:(not bool((record.layout_settings or {}).get("primary")),record.id))
 @app.get("/base-resumes/{id}",response_model=BaseResumeOut)
 def resume(id:int,s:Session=Depends(db)):
     o=s.get(BaseResume,id)
     if not o: raise HTTPException(404,"base resume not found")
+    if _backfill_checkpoint_skill_groups(o): s.commit()
     return o
 @app.get("/base-resumes/{id}/preview.pdf", response_class=Response)
 def base_resume_preview(id:int,download:bool=False,s:Session=Depends(db)):
@@ -2025,14 +2210,147 @@ def add_app(x:AppIn,s:Session=Depends(db)):
     if not s.get(BaseResume,x.base_resume_id): raise HTTPException(404,"base resume not found")
     if x.status not in APPLICATION_STATUSES: raise HTTPException(422,"invalid application status")
     values=x.model_dump()
+    values["job_url"]=_validated_http_url(values.get("job_url"),"job_url")
+    values["simplify_url"]=_validated_http_url(values.get("simplify_url"),"simplify_url")
+    listing_id=values.get("source_listing_id")
+    if listing_id is not None:
+        listing_id=listing_id.strip() or None
+        values["source_listing_id"]=listing_id
+    existing=_matching_existing_application(s,listing_id=listing_id,company=values["company"],
+                                            position=values["position"],job_url=values.get("job_url"))
+    if existing:
+        raise HTTPException(409,detail={"message":"job listing was already imported","application_id":existing.id})
     requested_status=values.pop("status")
     # applied_at is lifecycle-managed; callers may not seed or override it.
     values.pop("applied_at",None)
     o=Application(**values,status="draft",
         job_description_version=1,
-        job_description_fingerprint=_job_description_fingerprint(values["job_description"])); s.add(o); s.flush()
+        job_description_fingerprint=_job_description_fingerprint(values["job_description"])); s.add(o)
+    try:
+        s.flush()
+    except IntegrityError:
+        s.rollback()
+        existing=_matching_existing_application(s,listing_id=listing_id,company=values["company"],
+                                                position=values["position"],job_url=values.get("job_url"))
+        if existing:
+            raise HTTPException(409,detail={"message":"job listing was already imported","application_id":existing.id})
+        raise
     _transition_application(o,requested_status,s,reason="application created",initial=True)
     s.commit(); s.refresh(o); return o
+
+@app.get("/jobs")
+def public_jobs(search:str|None=None, category:str|None=None, location:str|None=None,
+                progress:str|None=None, page:int=1, page_size:int=25, s:Session=Depends(db)):
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(422,"page must be positive and page_size must be 1-100")
+    progress_values={"not_imported","resume_in_progress","ready_to_apply","applied","closed"}
+    if progress is not None and progress not in progress_values:
+        raise HTTPException(422,"progress must be not_imported, resume_in_progress, ready_to_apply, applied, or closed")
+    try:
+        listings=get_listings()
+    except Exception as exc:
+        # Do not expose feed URLs or transport details to API clients. The UI
+        # can show a retryable state and existing applications remain usable.
+        raise HTTPException(503,"Simplify job listings are temporarily unavailable") from exc
+    active=[item for item in listings if item.get("active") is not False]
+    categories=sorted({str(item["category"]) for item in active if item.get("category")})
+    term=(search or "").strip().casefold()
+    category_term=(category or "").strip().casefold()
+    location_term=(location or "").strip().casefold()
+    filtered=[]
+    for item in active:
+        company=str(item.get("company") or "")
+        position=str(item.get("position") or "")
+        locations=item.get("locations") or []
+        if term and term not in f"{company} {position}".casefold():
+            continue
+        if category_term and str(item.get("category") or "").casefold() != category_term:
+            continue
+        if location_term and not any(location_term in str(value).casefold() for value in locations):
+            continue
+        # Feed data is public but still treated as untrusted before it becomes
+        # a clickable link in the client.
+        item=dict(item)
+        try:
+            item["application_url"]=_validated_http_url(item.get("application_url"),"application_url")
+            item["simplify_url"]=_validated_http_url(item.get("simplify_url"),"simplify_url")
+        except HTTPException:
+            continue
+        filtered.append(item)
+    def listing_sort_key(item):
+        try:
+            posted=int(item.get("date_posted") or 0)
+        except (TypeError,ValueError):
+            posted=0
+        return (-posted,str(item.get("id") or ""))
+    filtered.sort(key=listing_sort_key)
+    applications=s.query(Application).order_by(Application.id).all()
+    apps_by_listing={application.source_listing_id:application for application in applications
+                     if application.source_listing_id}
+    apps_by_identity={}
+    for application in applications:
+        identity=_job_identity(application.company,application.position,application.job_url)
+        if identity is not None:
+            apps_by_identity.setdefault(identity,application)
+    linked_by_listing={}
+    for listing in filtered:
+        listing_id=str(listing["id"])
+        application=apps_by_listing.get(listing_id)
+        if application is None:
+            identity=_job_identity(str(listing.get("company") or ""),
+                                   str(listing.get("position") or ""),
+                                   listing.get("application_url"))
+            application=apps_by_identity.get(identity) if identity else None
+        linked_by_listing[listing_id]=application
+    app_ids=sorted({application.id for application in linked_by_listing.values() if application})
+    generated_app_ids=set()
+    for app_id in app_ids:
+        candidates=s.query(Revision).filter(
+            Revision.application_id==app_id,
+            Revision.status.in_(["draft","generated"]),
+            Revision.generated_at.is_not(None),
+        ).order_by(Revision.revision_number.desc()).all()
+        for candidate in candidates:
+            try:
+                _submittable_revision(app_id,candidate.id,s)
+                generated_app_ids.add(app_id)
+                break
+            except HTTPException:
+                # A persisted revision is only ready when the same artifact
+                # checks used by submission accept it.
+                continue
+    matched=[]
+    for listing in filtered:
+        application=linked_by_listing[str(listing["id"])]
+        if not application:
+            item_progress="not_imported"
+        elif application.status in TERMINAL_APPLICATION_STATUSES:
+            item_progress="closed"
+        elif application.submitted_revision_id is not None:
+            item_progress="applied"
+        elif application.id in generated_app_ids:
+            item_progress="ready_to_apply"
+        else:
+            item_progress="resume_in_progress"
+        if progress is None or progress==item_progress:
+            matched.append({**listing,"application_id":application.id if application else None,
+                            "progress":item_progress})
+    total=len(matched)
+    items=matched[(page-1)*page_size:page*page_size]
+    return {"items":items,"total":total,"page":page,"page_size":page_size,"categories":categories}
+
+@app.post("/jobs/description")
+async def job_description_for_url(x:JobDescriptionRequest):
+    url=_validated_http_url(x.url,"url")
+    try:
+        result=await fetch_job_description_async(url)
+    except Exception:
+        # The scraper normally returns an unavailable result itself, but keep
+        # network/parser failures on the same explicit fallback contract.
+        return {"status":"unavailable","text":"","title":"","source_url":url,"reason":"description could not be retrieved"}
+    return {"status":result.status,"text":result.text,"title":result.title,
+            "source_url":result.source_url,"reason":result.reason}
+
 @app.get("/applications",response_model=list[ApplicationOut])
 def applications(status:str|None=None, q:str|None=None, limit:int=50, offset:int=0, s:Session=Depends(db)):
     if not 1 <= limit <= 100 or offset < 0: raise HTTPException(422,"limit must be 1-100 and offset must be non-negative")
@@ -2052,6 +2370,9 @@ def edit_application(id:int,x:AppPatch,s:Session=Depends(db)):
     o=s.get(Application,id)
     if not o: raise HTTPException(404,"application not found")
     changes=x.model_dump(exclude_unset=True)
+    for link_field in ("job_url","simplify_url"):
+        if link_field in changes:
+            changes[link_field]=_validated_http_url(changes[link_field],link_field)
     status_reason=changes.pop("status_reason",None)
     has_submitted_revision="submitted_revision_id" in changes
     submitted_revision_id=changes.pop("submitted_revision_id",None)
@@ -3397,13 +3718,22 @@ def build_snapshot(a:Application|BaseResume,s:Session,proposal_payload:dict|None
             "summary":summary if section!="project" else "","bullets":entry_bullets})
 
     configured=[str(section).lower() for section in (base.section_order or [])]
-    verified_skills=s.query(Skill).filter_by(verified=True).order_by(Skill.category,Skill.name).all()
-    skill_groups=[]
-    for skill in verified_skills:
-        category=skill.category or "Skills"
-        group=next((record for record in skill_groups if record["category"]==category),None)
-        if group is None: group={"category":category,"skills":[]}; skill_groups.append(group)
-        group["skills"].append(skill.name)
+    settings=base.layout_settings if base else {}
+    skill_groups=settings.get("skill_groups") if isinstance(settings,dict) else None
+    if not isinstance(skill_groups,list):
+        skill_groups=None
+    if skill_groups is None:
+        _backfill_checkpoint_skill_groups(base)
+        settings=base.layout_settings if base else {}
+        skill_groups=settings.get("skill_groups") if isinstance(settings,dict) else None
+    if not isinstance(skill_groups,list):
+        verified_skills=s.query(Skill).filter_by(verified=True).order_by(Skill.category,Skill.name).all()
+        skill_groups=[]
+        for skill in verified_skills:
+            category=skill.category or "Skills"
+            group=next((record for record in skill_groups if record["category"]==category),None)
+            if group is None: group={"category":category,"skills":[]}; skill_groups.append(group)
+            group["skills"].append(skill.name)
     if skill_groups and "skills" not in configured:
         activity_index=configured.index("activities") if "activities" in configured else len(configured)
         configured.insert(activity_index,"skills")
@@ -3420,9 +3750,9 @@ def build_snapshot(a:Application|BaseResume,s:Session,proposal_payload:dict|None
     for field in ("linkedin","github","website"):
         value=contact.get(field,"")
         if value and not contact.get(f"{field}_label"):
-            contact[f"{field}_label"]=value.removeprefix("https://").removeprefix("http://").rstrip("/")
+            contact[f"{field}_label"]=value.removeprefix("https://").removeprefix("http://")
         if value and not value.startswith(("http://","https://")):
-            contact[f"{field}_label"]=value.rstrip("/")
+            contact[f"{field}_label"]=value
             contact[field]="https://"+value
     snapshot={"contact":contact,"sections":sections,
         "content_items":[{"id":items[item_id].id,"title":items[item_id].title,
@@ -3559,6 +3889,20 @@ def revision_detail(id:int,s:Session=Depends(db)):
     o=s.get(Revision,id)
     if not o: raise HTTPException(404,"revision not found")
     return o
+@app.get("/applications/{id}/revisions/{revision_id}/download.pdf")
+def download_revision_pdf(id:int,revision_id:int,s:Session=Depends(db)):
+    revision_to_download=_submittable_revision(id,revision_id,s)
+    pdf_path=Path(revision_to_download.pdf_path)
+    pdf_path=pdf_path if pdf_path.is_absolute() else ROOT/pdf_path
+    expected_root=(GENERATED/"applications"/str(id)).resolve()
+    try:
+        resolved_pdf=pdf_path.resolve(strict=True)
+        resolved_pdf.relative_to(expected_root)
+    except (OSError,ValueError):
+        raise HTTPException(404,"revision PDF not found")
+    if not resolved_pdf.is_file():
+        raise HTTPException(404,"revision PDF not found")
+    return FileResponse(resolved_pdf,media_type="application/pdf",filename="resume.pdf")
 @app.post("/applications/{id}/generate",response_model=GenerationOut)
 def generate(id:int,x:GenerateIn,s:Session=Depends(db)):
     a=s.get(Application,id)
